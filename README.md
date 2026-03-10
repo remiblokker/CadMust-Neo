@@ -67,7 +67,7 @@ Tests use synthetic board models and don't require KiCad.
 
 ## Heritage
 
-CadMust-Neo builds on [CadMust](https://gitlab.riscosopen.org/Usarc/CadMust), a RISC OS PCB CAD suite from the 1990s that included one of the earliest placement optimizers for desktop PCB design.
+CadMust-Neo builds on CadMust, a RISC OS PCB CAD suite from the 1990s that included one of the earliest placement optimizers for desktop PCB design.
 
 ## License
 
