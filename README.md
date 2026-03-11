@@ -44,7 +44,21 @@ A KiCad Action Plugin that optimizes PCB component placement using simulated ann
 3. Click the CadMust-Neo toolbar button
 4. Choose a quality preset (Fast / Balanced / Thorough) or switch to Expert mode for full control
 5. Click **Optimize**
-6. When finished, review the result. Use Edit > Undo if needed.
+6. Review the results — accept to keep the new placement, or reject to revert
+
+## Tips & workflow
+
+**Lock mechanical constraints first.** Connectors, mounting holes, LEDs, switches — anything with a fixed physical position should be locked before running the optimizer. Right-click a component → Properties → check "Locked".
+
+**Group decoupling caps with their IC.** Rather than locking bypass capacitors in place, group them with their associated IC. They'll move together as a rigid body while the optimizer finds the best position for the pair. In KiCad, select the IC and its caps, then right-click → Grouping → Group.
+
+**Use "Move selected only" for partial optimization.** If part of your board is already well placed, select just the components you want to rearrange and enable "Move selected components only" in the settings. The optimizer will only move the selection, leaving everything else untouched.
+
+**Multi-start mode prevents regression.** With multiple starts (Expert mode), start 0 always preserves your current placement as a baseline. The optimizer can only improve on it — if no better placement is found, you get your original back.
+
+**Best for initial placement.** The optimizer shines when you have a pile of unplaced components and want a good starting point. On a board that's already carefully hand-placed, there may be limited room for improvement.
+
+**Power and ground nets are auto-detected.** Nets like GND, VCC, VDD are automatically excluded from wirelength optimization since they'll be connected by power planes. You can override this in the net exclusion list (Normal/Expert mode).
 
 ## How it works
 

@@ -308,6 +308,129 @@ class _CostBar(wx.Panel):
             lx += 17 + tw + 12
 
 
+class _ResultsDialog(wx.Dialog):
+    """Results dialog with metrics, verdict, and Accept/Reject buttons."""
+
+    # Unicode indicators
+    _CHECK = "\u2714"  # ✔
+    _CROSS = "\u2718"  # ✘
+    _DASH = "\u2014"   # —
+
+    def __init__(self, parent, *, hpwl_before_mm, hpwl_after_mm, hpwl_change_pct,
+                 n_overlaps, n_keepout, n_silk_moved, elapsed, total_moves,
+                 accepted_moves):
+        super().__init__(parent, title="CadMust-Neo \u2014 Results",
+                         style=wx.DEFAULT_DIALOG_STYLE)
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # --- Verdict ---
+        hpwl_good = hpwl_change_pct >= 0
+        overlaps_good = n_overlaps == 0
+        keepout_good = n_keepout == 0
+
+        if hpwl_good and overlaps_good and keepout_good:
+            verdict_text = "Placement improved"
+            verdict_colour = wx.Colour(34, 139, 34)   # forest green
+        elif not hpwl_good and overlaps_good and keepout_good:
+            verdict_text = "Placement worsened"
+            verdict_colour = wx.Colour(200, 40, 40)    # red
+        else:
+            verdict_text = "Mixed results"
+            verdict_colour = wx.Colour(200, 140, 0)    # amber
+
+        verdict_label = wx.StaticText(self, label=verdict_text)
+        font = verdict_label.GetFont()
+        font.SetPointSize(font.GetPointSize() + 4)
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        verdict_label.SetFont(font)
+        verdict_label.SetForegroundColour(verdict_colour)
+        sizer.Add(verdict_label, 0, wx.ALL | wx.ALIGN_CENTER, 12)
+
+        # --- Metrics ---
+        metrics_sizer = wx.FlexGridSizer(cols=3, vgap=6, hgap=10)
+
+        def add_metric(indicator, colour, label, value):
+            ind = wx.StaticText(self, label=indicator)
+            ind_font = ind.GetFont()
+            ind_font.SetPointSize(ind_font.GetPointSize() + 2)
+            ind.SetFont(ind_font)
+            ind.SetForegroundColour(colour)
+            metrics_sizer.Add(ind, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            lbl = wx.StaticText(self, label=label)
+            metrics_sizer.Add(lbl, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            val = wx.StaticText(self, label=value)
+            val_font = val.GetFont()
+            val_font.SetWeight(wx.FONTWEIGHT_BOLD)
+            val.SetFont(val_font)
+            metrics_sizer.Add(val, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        green = wx.Colour(34, 139, 34)
+        red = wx.Colour(200, 40, 40)
+        grey = wx.Colour(120, 120, 120)
+
+        # Wirelength
+        if hpwl_change_pct >= 0:
+            add_metric(self._CHECK, green, "Wirelength",
+                       f"{hpwl_before_mm:.1f} \u2192 {hpwl_after_mm:.1f} mm  ({hpwl_change_pct:.1f}% shorter)")
+        else:
+            add_metric(self._CROSS, red, "Wirelength",
+                       f"{hpwl_before_mm:.1f} \u2192 {hpwl_after_mm:.1f} mm  ({-hpwl_change_pct:.1f}% longer)")
+
+        # Overlaps
+        if n_overlaps == 0:
+            add_metric(self._CHECK, green, "Overlaps", "none")
+        else:
+            add_metric(self._CROSS, red, "Overlaps", f"{n_overlaps} pairs")
+
+        # Keep-out violations
+        if n_keepout == 0:
+            add_metric(self._CHECK, green, "Keep-out violations", "none")
+        else:
+            add_metric(self._CROSS, red, "Keep-out violations", f"{n_keepout}")
+
+        # Silkscreen (neutral — always informational)
+        silk_msg = f"{n_silk_moved} refs repositioned" if n_silk_moved > 0 else "no changes needed"
+        add_metric(self._DASH, grey, "Silkscreen", silk_msg)
+
+        sizer.Add(metrics_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 16)
+
+        # --- Stats (smaller, grey) ---
+        stats_text = (
+            f"Moves: {total_moves:,} total, {accepted_moves:,} accepted  |  "
+            f"Time: {elapsed:.1f}s"
+        )
+        stats_label = wx.StaticText(self, label=stats_text)
+        stats_label.SetForegroundColour(wx.Colour(140, 140, 140))
+        stats_font = stats_label.GetFont()
+        stats_font.SetPointSize(stats_font.GetPointSize() - 1)
+        stats_label.SetFont(stats_font)
+        sizer.Add(stats_label, 0, wx.LEFT | wx.RIGHT, 16)
+
+        sizer.AddSpacer(16)
+
+        # --- Separator ---
+        sizer.Add(wx.StaticLine(self), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
+
+        sizer.AddSpacer(8)
+
+        # --- Accept / Reject buttons ---
+        btn_sizer = wx.StdDialogButtonSizer()
+        accept_btn = wx.Button(self, wx.ID_OK, "Accept")
+        accept_btn.SetDefault()
+        reject_btn = wx.Button(self, wx.ID_CANCEL, "Reject")
+        btn_sizer.AddButton(accept_btn)
+        btn_sizer.AddButton(reject_btn)
+        btn_sizer.Realize()
+        sizer.Add(btn_sizer, 0, wx.ALL | wx.ALIGN_CENTER, 8)
+
+        self.SetSizer(sizer)
+        self.Fit()
+        self.CentreOnScreen()
+
+
 class _ProgressDialog(wx.Dialog):
     """Custom progress dialog with temperature gradient bar and wirelength bar."""
 
@@ -626,23 +749,23 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         else:
             hpwl_change_pct = 0.0
 
+        # Count overlapping pairs
+        n_overlaps = sum(1 for v in verify_cs._pair_overlaps.values() if v > 0)
+
+        # Count keepout violations
+        n_keepout = sum(1 for v in verify_cs._fp_keepout.values() if v > 0)
+
+        # Build result summary for logging
         if hpwl_change_pct >= 0:
-            hpwl_msg = f"HPWL: {hpwl_before_mm:.1f} mm  \u2192  {hpwl_after_mm:.1f} mm  ({hpwl_change_pct:.1f}% shorter)"
+            hpwl_msg = f"HPWL: {hpwl_before_mm:.1f} mm \u2192 {hpwl_after_mm:.1f} mm ({hpwl_change_pct:.1f}% shorter)"
         else:
-            hpwl_msg = f"HPWL: {hpwl_before_mm:.1f} mm  \u2192  {hpwl_after_mm:.1f} mm  ({-hpwl_change_pct:.1f}% longer)"
-
-        overlap_msg = 'none' if verify_cs._overlap_penalty == 0 else f'{verify_cs._overlap_penalty/1e6:.1f} mm penalty'
-        keepout_msg = 'none' if verify_cs._keepout_penalty == 0 else f'{verify_cs._keepout_penalty/1e6:.1f} mm penalty'
-
-        silk_msg = f"{n_silk_moved} refs repositioned" if n_silk_moved > 0 else "no changes needed"
-
+            hpwl_msg = f"HPWL: {hpwl_before_mm:.1f} mm \u2192 {hpwl_after_mm:.1f} mm ({-hpwl_change_pct:.1f}% longer)"
         result_summary = (
             f"Optimization complete!\n\n"
             f"{hpwl_msg}\n"
-            f"Overlaps: {overlap_msg}\n"
-            f"Keep-out violations: {keepout_msg}\n"
-            f"Silkscreen: {silk_msg}\n"
-            f"Temperature steps: {result.temperature_steps}\n"
+            f"Overlaps: {n_overlaps} pairs\n"
+            f"Keep-out violations: {n_keepout}\n"
+            f"Silkscreen: {n_silk_moved} refs repositioned\n"
             f"Moves: {result.total_moves} total, {result.accepted_moves} accepted\n"
             f"Time: {elapsed:.1f}s"
         )
@@ -655,9 +778,21 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         except Exception:
             pass
 
-        wx.MessageBox(
-            f"{result_summary}\n\n"
-            f"Use Edit \u2192 Undo to revert if needed.",
-            "CadMust-Neo",
-            wx.OK | wx.ICON_INFORMATION,
+        # Show results dialog with Accept/Reject
+        rdlg = _ResultsDialog(
+            None,
+            hpwl_before_mm=hpwl_before_mm,
+            hpwl_after_mm=hpwl_after_mm,
+            hpwl_change_pct=hpwl_change_pct,
+            n_overlaps=n_overlaps,
+            n_keepout=n_keepout,
+            n_silk_moved=n_silk_moved,
+            elapsed=elapsed,
+            total_moves=result.total_moves,
+            accepted_moves=result.accepted_moves,
         )
+        accepted = rdlg.ShowModal() == wx.ID_OK
+        rdlg.Destroy()
+
+        if not accepted:
+            restore_original_positions(board, original_positions)
