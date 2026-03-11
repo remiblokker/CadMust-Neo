@@ -233,8 +233,38 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
                     continue
                 pts_world = []
                 try:
-                    pts_world.append(item.GetStart())
-                    pts_world.append(item.GetEnd())
+                    # For circles, GetStart() is the center and GetEnd() is a point on the perimeter.
+                    # Just adding them would only bound a single quadrant! 
+                    is_circle = False
+                    if hasattr(item, 'GetShape'):
+                        shape_val = item.GetShape()
+                        is_circle = shape_val in (getattr(_pcbnew, 'S_CIRCLE', -1), getattr(_pcbnew, 'SHAPE_T_CIRCLE', -1))
+                    
+                    if is_circle and hasattr(item, 'GetCenter') and hasattr(item, 'GetRadius'):
+                        c = item.GetCenter()
+                        r = item.GetRadius()
+                        class Pt:
+                            def __init__(self, x, y):
+                                self.x = x
+                                self.y = y
+                        
+                        # Calculate local center coordinates
+                        tx_c = c.x - pos.x
+                        ty_c = c.y - pos.y
+                        lcx = tx_c * cos_a - ty_c * sin_a
+                        lcy = tx_c * sin_a + ty_c * cos_a
+                        
+                        # Generate world points that un-rotate perfectly to the local 2r x 2r bounding box
+                        def local_to_world(lx, ly):
+                            return Pt(pos.x + lx * cos_a + ly * sin_a, pos.y - lx * sin_a + ly * cos_a)
+                            
+                        pts_world.append(local_to_world(lcx - r, lcy - r))
+                        pts_world.append(local_to_world(lcx + r, lcy - r))
+                        pts_world.append(local_to_world(lcx - r, lcy + r))
+                        pts_world.append(local_to_world(lcx + r, lcy + r))
+                    else:
+                        pts_world.append(item.GetStart())
+                        pts_world.append(item.GetEnd())
                 except AttributeError:
                     pass
                 try:
