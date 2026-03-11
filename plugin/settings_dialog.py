@@ -95,6 +95,8 @@ class SettingsDialog(wx.Dialog):
         self._board_info = board_info
         self._net_list_names: List[str] = []   # parallel to checklist items
         self._net_checklist: Optional[wx.CheckListBox] = None
+        self._net_hint: Optional[wx.StaticText] = None
+        self._chk_select_all: Optional[wx.CheckBox] = None
         self._net_sizer: Optional[wx.StaticBoxSizer] = None
 
         self._build_ui()
@@ -343,19 +345,19 @@ class SettingsDialog(wx.Dialog):
             net_sizer = self._net_sizer
 
             hint_sizer = wx.BoxSizer(wx.HORIZONTAL)
-            hint = wx.StaticText(
+            self._net_hint = wx.StaticText(
                 self,
                 label="Checked nets are excluded from wire-length optimisation:"
             )
-            hint.SetForegroundColour(wx.Colour(80, 80, 80))
-            hint.SetToolTip(
+            self._net_hint.SetForegroundColour(wx.Colour(80, 80, 80))
+            self._net_hint.SetToolTip(
                 "Power/ground nets (GND, VCC, +5V, …) connect to almost every\n"
                 "component — their HPWL can't be reduced, so excluding them lets\n"
                 "the optimizer focus on signal nets.\n\n"
                 "You can also exclude high-fanout signal nets (buses, clocks)\n"
                 "if they dominate the score and can't realistically be shortened."
             )
-            hint_sizer.Add(hint, 1, wx.ALIGN_CENTER_VERTICAL)
+            hint_sizer.Add(self._net_hint, 1, wx.ALIGN_CENTER_VERTICAL)
 
             self._chk_select_all = wx.CheckBox(self, label="All")
             self._chk_select_all.SetToolTip("Check or uncheck all nets")
@@ -453,6 +455,9 @@ class SettingsDialog(wx.Dialog):
         # Net exclusion — Normal + Expert only
         if self._net_sizer is not None:
             self._net_sizer.GetStaticBox().Show(show_params)
+            self._net_hint.Show(show_params)
+            self._chk_select_all.Show(show_params)
+            self._net_checklist.Show(show_params)
 
         self.Layout()
         self.Fit()
