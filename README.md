@@ -48,15 +48,20 @@ A KiCad Action Plugin that optimizes PCB component placement using simulated ann
 
 ## Tips & workflow
 
-**Lock mechanical constraints first.** Connectors, mounting holes, LEDs, switches — anything with a fixed physical position should be locked before running the optimizer. Right-click a component → Properties → check "Locked".
+### Recommended workflow
 
-**Group decoupling caps with their IC.** Rather than locking bypass capacitors in place, group them with their associated IC. They'll move together as a rigid body while the optimizer finds the best position for the pair. In KiCad, select the IC and its caps, then right-click → Grouping → Group.
+1. **Draw the board outline** on the Edge.Cuts layer. The optimizer needs this to keep components within bounds.
+2. **Lock mechanical constraints** — connectors, mounting holes, LEDs, switches. Right-click → Properties → check "Locked".
+3. **Place and lock critical ICs** (optional but recommended) — roughly position your key components (microcontrollers, FPGAs, memory ICs, etc.) and their immediate support circuitry where they need to be, then lock them. The optimizer will pull unlocked components toward these anchors via net connectivity. Alternatively, you can skip this step and let the optimizer do a first pass on everything — then lock what looks good and iterate.
+4. **Position and group decoupling caps** with their IC (select all, right-click → Grouping → Group) so they stay together as a rigid body during optimization.
+5. **Run the optimizer** on all remaining unlocked components to get a proper initial placement.
+6. **Iterate** — if an area doesn't look right, unlock it, adjust, and re-run.
 
-**Use "Move selected only" for partial optimization.** If part of your board is already well placed, select just the components you want to rearrange and enable "Move selected components only" in the settings. The optimizer will only move the selection, leaving everything else untouched.
+### Additional tips
+
+**Use "Move selected only" for targeted rework.** If your board is mostly done but a specific area needs rearranging, select just those components and enable "Move selected components only". This leaves the rest of the board untouched.
 
 **Multi-start mode prevents regression.** With multiple starts (Expert mode), start 0 always preserves your current placement as a baseline. The optimizer can only improve on it — if no better placement is found, you get your original back.
-
-**Best for initial placement.** The optimizer shines when you have a pile of unplaced components and want a good starting point. On a board that's already carefully hand-placed, there may be limited room for improvement.
 
 **Power and ground nets are auto-detected.** Nets like GND, VCC, VDD are automatically excluded from wirelength optimization since they'll be connected by power planes. You can override this in the net exclusion list (Normal/Expert mode).
 
