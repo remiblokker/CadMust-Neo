@@ -40,6 +40,67 @@ def _get_group_members(model: BoardModel, fp_index: int) -> List[int]:
     return [fp_index]
 
 
+# Edge-locked footprints sit this far inside their outline-bbox edge.
+EDGE_LOCK_MARGIN = 1_000_000  # 1.0 mm
+
+
+def resnap_edges(model: BoardModel, members: List[int]) -> None:
+    """Re-snap edge-locked members so their bbox touches their edge (+margin).
+
+    Only the coordinate perpendicular to the edge is corrected, so an
+    edge-locked part slides along its edge. The correction is applied to all
+    members (a rigid group containing an edge-locked part moves as a whole).
+    If several members are edge-locked, the first one per axis decides that
+    axis. The edge is the outline bounding box edge, matching the checker's
+    edge distance definition.
+    """
+    el = model.edge_locked_indices
+    if not el:
+        return
+    fps = model.footprints
+    dx = dy = 0
+    have_x = have_y = False
+    for idx in members:
+        if idx not in el:
+            continue
+        fp = fps[idx]
+        edge = fp.edge_lock
+        if edge is None:
+            continue
+        x1, y1, x2, y2 = fp.bbox
+        if edge == "top":
+            if not have_y:
+                dy = model.outline_ymin + EDGE_LOCK_MARGIN - y1
+                have_y = True
+        elif edge == "bottom":
+            if not have_y:
+                dy = model.outline_ymax - EDGE_LOCK_MARGIN - y2
+                have_y = True
+        elif edge == "left":
+            if not have_x:
+                dx = model.outline_xmin + EDGE_LOCK_MARGIN - x1
+                have_x = True
+        elif edge == "right":
+            if not have_x:
+                dx = model.outline_xmax - EDGE_LOCK_MARGIN - x2
+                have_x = True
+    if dx or dy:
+        for idx in members:
+            fp = fps[idx]
+            fp.x += dx
+            fp.y += dy
+
+
+def _members_edge_locked(model: BoardModel, members: List[int]) -> bool:
+    el = model.edge_locked_indices
+    if not el:
+        return False
+    for idx in members:
+        if idx in el:
+            return True
+    return False
+
+
 def _fp_half_dims(fp) -> Tuple[int, int]:
     """Return (half_width, half_height) accounting for rotation."""
     if int(fp.angle_deg) % 180 == 90:
@@ -250,6 +311,8 @@ def _kickout_polygon_violations(
                 model.footprints[idx].x += best_dx
                 model.footprints[idx].y += best_dy
             _clamp_group_to_board(model, members)
+            if model.edge_locked_indices:
+                resnap_edges(model, members)
             count += 1
 
     if count > 0:
@@ -313,6 +376,9 @@ def do_translate(model: BoardModel, t_ratio: float, window: int) -> MoveUndo:
         fp.x += dx
         fp.y += dy
 
+    if model.edge_locked_indices:
+        resnap_edges(model, members)
+
     return undo
 
 
@@ -371,6 +437,8 @@ def do_median(model: BoardModel, t_ratio: float, noise: int) -> MoveUndo:
         for idx in members:
             fps[idx].x += dx
             fps[idx].y += dy
+        if model.edge_locked_indices:
+            resnap_edges(model, members)
         return undo
 
     target_x = sum_x // count
@@ -399,6 +467,9 @@ def do_median(model: BoardModel, t_ratio: float, noise: int) -> MoveUndo:
         fp.x += dx
         fp.y += dy
 
+    if model.edge_locked_indices:
+        resnap_edges(model, members)
+
     return undo
 
 
@@ -408,7 +479,8 @@ def do_swap(model: BoardModel) -> Optional[MoveUndo]:
     If both are ungrouped, swap their positions directly.
     If either is grouped, swap the centroids of the two groups and
     translate all members accordingly.
-    Does not swap within the same group.
+    Does not swap within the same group. Swaps involving an edge-locked
+    footprint are rejected (None): a swap would teleport it off its edge.
     """
     if len(model.moveable_indices) < 2:
         return None
@@ -426,6 +498,10 @@ def do_swap(model: BoardModel) -> Optional[MoveUndo]:
 
     members1 = _get_group_members(model, mi1)
     members2 = _get_group_members(model, mi2)
+    if model.edge_locked_indices and (
+            _members_edge_locked(model, members1)
+            or _members_edge_locked(model, members2)):
+        return None
 
     undo = MoveUndo(move_type="swap")
     for idx in members1 + members2:
@@ -488,6 +564,10 @@ def do_rotate(model: BoardModel) -> MoveUndo:
             fp.x = cx + int(dx * cos_r - dy * sin_r)
             fp.y = cy + int(dx * sin_r + dy * cos_r)
             fp.set_angle((fp.angle_deg + rotation) % 360.0)
+
+    # Rotation changes the bbox extent: re-snap edge-locked parts to their edge
+    if model.edge_locked_indices:
+        resnap_edges(model, members)
 
     return undo
 

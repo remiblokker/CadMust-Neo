@@ -11,6 +11,17 @@ the query's right edge. The bisect narrows the scan vs the previous O(n) flat sc
 Congestion estimation divides the board into routing bins and counts how many net
 bounding boxes cross each bin.  Bins where demand exceeds capacity incur a
 quadratic penalty.  Disabled when congestion_weight == 0 (zero overhead).
+
+Constraint-file terms (see constraints.py; all inactive, with no per-move work,
+when the model carries no constraints):
+  * per-net HPWL weight (Net.weight): the weighted excess over the raw HPWL is
+    kept as a separate float, so `hpwl` stays the raw value for reporting;
+  * soft group cohesion: penalty when a group's union-bbox diagonal exceeds
+    its max span;
+  * zone preference: distance from the footprint position to its preferred
+    zone rectangle;
+  * component clearance (Footprint.clearance): bbox inflated in the overlap test,
+    against bodies on both sides unless restricted to one side.
 """
 from __future__ import annotations
 
@@ -28,6 +39,8 @@ POLYGON_BOUNDARY_WEIGHT = 500.0  # polygon cutout violations (nm); 10× BOUNDARY
                             # weight equals OVERLAP_WEIGHT — preventing SA from trading
                             # cutout placement for overlap relief even at high temperature.
 KEEPOUT_WEIGHT = 100.0      # per-violation, multiplied by overlap distance (nm)
+COHESION_WEIGHT = 1.0       # per soft group, times excess span (nm): 1 mm excess = 1 mm wire
+ZONE_WEIGHT = 1.0           # per footprint, times distance to preferred zone (nm)
 
 # Default congestion bin capacity: assumes 2-layer board, 0.4mm track pitch,
 # both horizontal and vertical routing.  capacity = (bin_size / pitch) * layers * 2.
@@ -234,6 +247,10 @@ class CostState:
         self._boundary_penalty: float = 0.0
         self._keepout_penalty: float = 0.0
         self._congestion_penalty: float = 0.0
+        self._hpwl_extra: float = 0.0       # sum (weight - 1) * net_hpwl over weighted nets
+        self._cohesion_penalty: float = 0.0
+        self._zone_penalty: float = 0.0
+        self._soft_penalty: float = 0.0     # cohesion + zone (one load in total_cost)
         self._congestion_weight: float = congestion_weight
         self._congestion_bin_size: int = congestion_bin_size
         self.penalty_scale: float = 1.0  # scales boundary+keepout+congestion (not overlap)
@@ -277,6 +294,44 @@ class CostState:
         for fp in model.footprints:
             if not hasattr(fp, 'th_rects'):
                 fp.th_rects = []
+
+        # --- Constraint-file terms (all empty / zero without constraints) ---
+        # Net weights: only nets with weight != 1 are tracked.
+        self._net_w: Dict[int, float] = {}
+        for nc, net in model.nets.items():
+            w = getattr(net, 'weight', 1.0)
+            if w != 1.0 and not net.is_excluded:
+                self._net_w[nc] = w
+        # Soft cohesion groups: (member_indices, max_span_nm)
+        self._soft_groups: List[Tuple[List[int], int]] = [
+            (list(idx), int(span))
+            for _gid, idx, span in (getattr(model, 'soft_groups', None) or [])
+            if len(idx) >= 2
+        ]
+        self._fp_soft: Dict[int, List[int]] = {}
+        for gi, (idx, _span) in enumerate(self._soft_groups):
+            for fi in idx:
+                self._fp_soft.setdefault(fi, []).append(gi)
+        self._group_cost: List[float] = [0.0] * len(self._soft_groups)
+        # Zone preferences: fp_index -> rect
+        self._zone_rects: Dict[int, Tuple[float, float, float, float]] = dict(
+            getattr(model, 'zone_prefs', None) or {})
+        self._fp_zone: Dict[int, float] = {}
+        # One flag for the cohesion + zone terms (checked once per update)
+        self._extra_terms: bool = bool(self._soft_groups or self._zone_rects)
+        # Component clearances: per-fp ring (nm) and side restriction
+        self._fp_clear: List[int] = [
+            int(getattr(fp, 'clearance', 0) or 0) for fp in model.footprints
+        ]
+        self._fp_clear_side: List[Optional[bool]] = [
+            getattr(fp, 'clearance_side', None) for fp in model.footprints
+        ]
+        self._max_clear: int = max(self._fp_clear) if self._fp_clear else 0
+        self._clear_fps: List[int] = [i for i, c in enumerate(self._fp_clear) if c > 0]
+        if self._max_clear > 0:
+            # Shadow the plain pair test with the clearance-aware one; boards
+            # without clearances keep the original method untouched.
+            self._compute_pair_overlap = self._compute_pair_overlap_clear
 
         # Cached board extents — avoid self.model.X attribute chain in hot path.
         self._oxmin: int = model.outline_xmin
@@ -401,6 +456,10 @@ class CostState:
             h = self._compute_net_hpwl(net)
             self.net_hpwl[nc] = h
             self._total_hpwl += h
+        extra = 0.0
+        for nc, w in self._net_w.items():
+            extra += (w - 1.0) * self.net_hpwl.get(nc, 0)
+        self._hpwl_extra = extra
 
     def _same_group(self, i: int, j: int) -> bool:
         """Check if footprints i and j are in the same component group."""
@@ -453,6 +512,49 @@ class CostState:
         if ox > 0 and oy > 0:
             return (ox + oy) * OVERLAP_WEIGHT
         return 0.0
+
+    @staticmethod
+    def _inflate(r: Tuple[int, int, int, int], c: int) -> Tuple[int, int, int, int]:
+        return (r[0] - c, r[1] - c, r[2] + c, r[3] + c)
+
+    def _compute_pair_overlap_clear(self, i: int, j: int) -> float:
+        """Pair overlap with component clearances (keep-out rings).
+
+        A footprint's ring applies to a pair when its side restriction is
+        None (both sides) or equals the OTHER footprint's side, as in the
+        checker. When it applies, the footprint's bbox is inflated by its
+        clearance and tested against the other's raw bbox, on either side of
+        the board (a both-sides antenna keep-out also excludes back-side
+        bodies). The larger of the ring overlaps and the plain pair overlap
+        (same-side body or opposite-side through-hole interaction) counts.
+        Same-group pairs stay exempt.
+        """
+        ci = self._fp_clear[i]
+        cj = self._fp_clear[j]
+        if ci:
+            si = self._fp_clear_side[i]
+            if si is not None and si != self._fp_is_front[j]:
+                ci = 0
+        if cj:
+            sj = self._fp_clear_side[j]
+            if sj is not None and sj != self._fp_is_front[i]:
+                cj = 0
+        plain = CostState._compute_pair_overlap(self, i, j)
+        if not ci and not cj:
+            return plain
+        if self._same_group(i, j):
+            return 0.0
+        fps = self.model.footprints
+        ro = self._rect_overlap
+        bi = fps[i].bbox
+        bj = fps[j].bbox
+        v = 0
+        if ci:
+            v = ro(self._inflate(bi, ci), bj)
+        if cj:
+            v = max(v, ro(bi, self._inflate(bj, cj)))
+        ring = v * OVERLAP_WEIGHT
+        return ring if ring > plain else plain
 
     def _compute_overlap_penalty(self) -> float:
         """O(n^2) bounding-box overlap check. Populates per-pair cache."""
@@ -543,6 +645,85 @@ class CostState:
                 total += v
         return total
 
+    # --- Soft group cohesion and zone preference (constraint file) ---
+
+    def _compute_group_cohesion(self, gi: int) -> float:
+        """max(0, union-bbox diagonal - max_span) * COHESION_WEIGHT for one group."""
+        idx, span = self._soft_groups[gi]
+        bx1 = self._bx1; by1 = self._by1; bx2 = self._bx2; by2 = self._by2
+        i0 = idx[0]
+        x1 = bx1[i0]; y1 = by1[i0]; x2 = bx2[i0]; y2 = by2[i0]
+        for k in idx:
+            if bx1[k] < x1: x1 = bx1[k]
+            if by1[k] < y1: y1 = by1[k]
+            if bx2[k] > x2: x2 = bx2[k]
+            if by2[k] > y2: y2 = by2[k]
+        excess = math.hypot(x2 - x1, y2 - y1) - span
+        return excess * COHESION_WEIGHT if excess > 0 else 0.0
+
+    def _compute_fp_zone(self, fi: int) -> float:
+        """Distance from the footprint position to its preferred zone rect."""
+        r = self._zone_rects.get(fi)
+        if r is None:
+            return 0.0
+        fp = self.model.footprints[fi]
+        x = fp.x
+        y = fp.y
+        dx = max(r[0] - x, 0, x - r[2])
+        dy = max(r[1] - y, 0, y - r[3])
+        if dx == 0 and dy == 0:
+            return 0.0
+        return math.hypot(dx, dy) * ZONE_WEIGHT
+
+    def _compute_extra_all(self) -> None:
+        """Full recompute of the cohesion and zone terms (bbox arrays must be current)."""
+        total = 0.0
+        for gi in range(len(self._soft_groups)):
+            v = self._compute_group_cohesion(gi)
+            self._group_cost[gi] = v
+            total += v
+        self._cohesion_penalty = total
+        self._fp_zone.clear()
+        total = 0.0
+        for fi in self._zone_rects:
+            v = self._compute_fp_zone(fi)
+            if v > 0:
+                self._fp_zone[fi] = v
+                total += v
+        self._zone_penalty = total
+        self._soft_penalty = self._cohesion_penalty + total
+
+    def _update_extra(self, moved_fp_indices: Set[int]) -> None:
+        """Incremental cohesion (groups containing a moved fp) and zone update."""
+        fp_soft = self._fp_soft
+        if fp_soft:
+            groups: Set[int] = set()
+            for fi in moved_fp_indices:
+                gl = fp_soft.get(fi)
+                if gl:
+                    groups.update(gl)
+            if groups:
+                gc = self._group_cost
+                pen = self._cohesion_penalty
+                for gi in groups:
+                    v = self._compute_group_cohesion(gi)
+                    pen += v - gc[gi]
+                    gc[gi] = v
+                self._cohesion_penalty = pen
+        zr = self._zone_rects
+        if zr:
+            fz = self._fp_zone
+            pen = self._zone_penalty
+            for fi in moved_fp_indices:
+                if fi in zr:
+                    old_v = fz.pop(fi, 0.0)
+                    v = self._compute_fp_zone(fi)
+                    if v > 0:
+                        fz[fi] = v
+                    pen += v - old_v
+            self._zone_penalty = pen
+        self._soft_penalty = self._cohesion_penalty + self._zone_penalty
+
     # --- Congestion ---
 
     def _compute_net_bbox(self, net: Net):
@@ -619,6 +800,8 @@ class CostState:
         self._boundary_penalty = self._compute_boundary_penalty()
         self._keepout_penalty = self._compute_keepout_penalty()
         self._build_congestion()
+        if self._extra_terms:
+            self._compute_extra_all()
 
     def update_penalty_scale(self, scale: float) -> None:
         """Set the penalty scale for boundary and keepout penalties.
@@ -629,10 +812,11 @@ class CostState:
 
     @property
     def total_cost(self) -> float:
-        """Cost with current penalty_scale applied to boundary+keepout+congestion."""
-        return (float(self._total_hpwl) + self._overlap_penalty
+        """Cost with current penalty_scale applied to boundary+keepout+congestion
+        (and the constraint-file cohesion and zone terms)."""
+        return (float(self._total_hpwl) + self._hpwl_extra + self._overlap_penalty
                 + (self._boundary_penalty + self._keepout_penalty
-                   + self._congestion_penalty)
+                   + self._congestion_penalty + self._soft_penalty)
                 * self.penalty_scale)
 
     @property
@@ -642,13 +826,19 @@ class CostState:
         Used for best-solution tracking so solutions are compared fairly
         regardless of when they were found during the anneal.
         """
-        return (float(self._total_hpwl) + self._overlap_penalty
+        return (float(self._total_hpwl) + self._hpwl_extra + self._overlap_penalty
                 + self._boundary_penalty + self._keepout_penalty
-                + self._congestion_penalty)
+                + self._congestion_penalty + self._soft_penalty)
 
     @property
     def hpwl(self) -> int:
+        """Raw (unweighted) HPWL sum; net weights only affect the total cost."""
         return self._total_hpwl
+
+    @property
+    def weighted_hpwl(self) -> float:
+        """HPWL with per-net weights applied (equals hpwl without weights)."""
+        return float(self._total_hpwl) + self._hpwl_extra
 
     def snapshot(self, moved_fp_indices: Set[int]) -> dict:
         """Save cost state for affected footprints, so it can be restored
@@ -691,7 +881,7 @@ class CostState:
             }
 
         self.t_snapshot += time.perf_counter() - _ts
-        return {
+        snap = {
             'hpwl': self._total_hpwl,
             'overlap': self._overlap_penalty,
             'boundary': self._boundary_penalty,
@@ -704,6 +894,25 @@ class CostState:
             'saved_bbox': saved_bbox,
             'moved_fp_indices': moved_fp_indices,
         }
+        if self._net_w:
+            snap['hpwl_extra'] = self._hpwl_extra
+        if self._extra_terms:
+            groups: Set[int] = set()
+            fp_soft = self._fp_soft
+            for fi in moved_fp_indices:
+                gl = fp_soft.get(fi)
+                if gl:
+                    groups.update(gl)
+            gc = self._group_cost
+            fz = self._fp_zone
+            snap['extra'] = (
+                self._cohesion_penalty,
+                {gi: gc[gi] for gi in groups},
+                self._zone_penalty,
+                {fi: fz.get(fi, 0.0) for fi in moved_fp_indices
+                 if fi in self._zone_rects},
+            )
+        return snap
 
     def restore(self, snap: dict) -> None:
         """Restore cost state from a snapshot. O(k) — no recomputation.
@@ -717,6 +926,22 @@ class CostState:
         self._keepout_penalty = snap['keepout']
         for nc, h in snap['net_hpwl'].items():
             self.net_hpwl[nc] = h
+        if self._net_w:
+            self._hpwl_extra = snap['hpwl_extra']
+        if self._extra_terms:
+            coh, gsaved, zpen, zsaved = snap['extra']
+            self._cohesion_penalty = coh
+            gc = self._group_cost
+            for gi, v in gsaved.items():
+                gc[gi] = v
+            self._zone_penalty = zpen
+            self._soft_penalty = coh + zpen
+            fz = self._fp_zone
+            for fi, v in zsaved.items():
+                if v > 0:
+                    fz[fi] = v
+                else:
+                    fz.pop(fi, None)
 
         # Purge ALL overlap pairs involving moved fps, then restore saved ones
         moved = snap.get('moved_fp_indices', set())
@@ -790,6 +1015,14 @@ class CostState:
         affected_nets: Set[int] = set()
         for fi in moved_fp_indices:
             affected_nets.update(fps[fi].net_codes)
+        net_w = self._net_w
+        if net_w:
+            nh = self.net_hpwl
+            w_before = 0.0
+            for nc in affected_nets:
+                w = net_w.get(nc)
+                if w is not None:
+                    w_before += (w - 1.0) * nh.get(nc, 0)
         cong_enabled = self._cong_grid is not None
         net_bboxes: Dict[int, Optional[Tuple[int, int, int, int]]] = {}
         if cong_enabled:
@@ -811,6 +1044,13 @@ class CostState:
                 new_h = self._compute_net_hpwl(net)
                 self._total_hpwl += (new_h - old_h)
                 self.net_hpwl[nc] = new_h
+        if net_w:
+            w_after = 0.0
+            for nc in affected_nets:
+                w = net_w.get(nc)
+                if w is not None:
+                    w_after += (w - 1.0) * nh.get(nc, 0)
+            self._hpwl_extra += w_after - w_before
         _t1 = time.perf_counter()
         self.t_hpwl += _t1 - _t0
 
@@ -826,9 +1066,25 @@ class CostState:
         bx1 = self._bx1; by1 = self._by1
         bx2 = self._bx2; by2 = self._by2
         xmin_items = self._xmin_items
+        # Clearance rings: a moved fp's own ring widens its window; the few
+        # fps that carry a ring are tested explicitly below (cheaper than
+        # widening every scan by the largest ring).
+        has_clear = self._max_clear
+        fp_clear = self._fp_clear
         for mi in moved_fp_indices:
             mi_x1 = bx1[mi]; mi_y1 = by1[mi]
             mi_x2 = bx2[mi]; mi_y2 = by2[mi]
+            if has_clear:
+                c = fp_clear[mi]
+                if c:
+                    mi_x1 -= c; mi_y1 -= c
+                    mi_x2 += c; mi_y2 += c
+                for j in self._clear_fps:
+                    if j != mi and j not in moved_fp_indices:
+                        cj = fp_clear[j] + fp_clear[mi]
+                        if (bx1[j] - cj < bx2[mi] and bx2[j] + cj > bx1[mi]
+                                and by1[j] - cj < by2[mi] and by2[j] + cj > by1[mi]):
+                            pairs_to_update.add(_pair_key(mi, j))
             # All fps with xmin < mi_x2 are candidates (left edge left of query right edge)
             i1 = bisect.bisect_left(xmin_items, (mi_x2, -1))
             for k in range(i1):
@@ -885,5 +1141,9 @@ class CostState:
         if self._cong_grid is not None:
             self._update_congestion(affected_nets, net_bboxes)
             self.t_congestion += time.perf_counter() - _t4
+
+        # --- Cohesion + zone (constraint file; skipped without constraints) ---
+        if self._extra_terms:
+            self._update_extra(moved_fp_indices)
 
         return self.total_cost

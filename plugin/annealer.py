@@ -14,7 +14,7 @@ from .cost_function import CostState
 from .moves import (
     select_move_type, do_translate, do_median, do_swap, do_rotate,
     revert_move, affected_indices, MoveUndo, _get_group_members,
-    _compute_t_ratio,
+    _compute_t_ratio, resnap_edges,
 )
 
 
@@ -39,6 +39,8 @@ class SAConfig:
     reheat_ratio: float = 0.30       # reheat to this fraction of T0
 
     num_starts: int = 1              # multi-start: total independent runs (1 = classic single-run)
+    scatter_first_start: bool = False  # True: start 0 is scattered too (fair benchmark,
+                                       # not seeded with the existing placement)
 
     congestion_weight: float = 0.0   # 0 = disabled; ~2.0 for moderate congestion avoidance
     congestion_bin_size: int = 5_000_000  # routing bin size in nm (5mm default)
@@ -369,6 +371,8 @@ def _greedy_refine(
                         model.footprints[idx].x += dx
                         model.footprints[idx].y += dy
                     _clamp_group_to_board(model, members)
+                    if model.edge_locked_indices:
+                        resnap_edges(model, members)
 
                     # Skip if this enters a keepout or polygon cutout
                     if (_hits_new_keepout(model, members, old_states) or
@@ -401,6 +405,8 @@ def _greedy_refine(
                 for rot in rotations:
                     fp.set_angle((old_states[0][3] + rot) % 360.0)
                     _clamp_group_to_board(model, members)
+                    if model.edge_locked_indices:
+                        resnap_edges(model, members)
                     if (_hits_new_keepout(model, members, old_states) or
                             _hits_polygon_cutout(model, members, old_states)):
                         fp.x = old_states[0][1]
@@ -470,6 +476,8 @@ def _perturb_positions(model: BoardModel, fraction: float = 0.25) -> None:
             model.footprints[idx].x += dx
             model.footprints[idx].y += dy
             perturbed.add(idx)
+        if model.edge_locked_indices:
+            resnap_edges(model, members)
 
 
 def _scatter_positions(model: BoardModel) -> None:
@@ -479,6 +487,7 @@ def _scatter_positions(model: BoardModel) -> None:
     moved to a random position within the inner 75% of the board (1/8 margin
     on each side). Groups move as rigid bodies: compute group centroid, pick
     a random new centroid, translate all members by the same delta.
+    Edge-locked parts (and their rigid groups) are re-snapped to their edge.
     """
     board_w = model.outline_xmax - model.outline_xmin
     board_h = model.outline_ymax - model.outline_ymin
@@ -509,6 +518,8 @@ def _scatter_positions(model: BoardModel) -> None:
             model.footprints[idx].x += dx
             model.footprints[idx].y += dy
             scattered.add(idx)
+        if model.edge_locked_indices:
+            resnap_edges(model, members)
 
 
 def run_sa(
@@ -582,9 +593,10 @@ def run_sa(
         if cancelled:
             break
 
-        # Restore to initial placement and scatter (for starts > 0)
+        # Restore to initial placement and scatter (for starts > 0, and for
+        # start 0 too when scatter_first_start is set)
         _restore_positions(model, initial_positions)
-        if start_i > 0:
+        if start_i > 0 or config.scatter_first_start:
             _scatter_positions(model)
 
         # Fresh cost state for this start

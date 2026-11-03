@@ -108,6 +108,12 @@ class Footprint:
     # on both board sides, so these rects also block the opposite side
     # (unlike the body bbox).
     th_rects: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    # Constraint-file attributes (set by constraints.apply_constraints).
+    # Plain defaults become class attributes, so BoardModels pickled before
+    # these fields existed still read the defaults.
+    edge_lock: Optional[str] = None      # "top"/"bottom"/"left"/"right": slides along that edge
+    clearance: int = 0                   # component-centred keep-out ring (nm), 0 = none
+    clearance_side: Optional[bool] = None  # None = both sides, True = front only, False = back only
     # Cached trig values for abs_position (updated via set_angle)
     _cos_a: float = field(init=False, repr=False, default=1.0)
     _sin_a: float = field(init=False, repr=False, default=0.0)
@@ -172,6 +178,7 @@ class Net:
     net_name: str
     pad_refs: List[Tuple[int, int]] = field(default_factory=list)  # (fp_index, pad_index)
     is_excluded: bool = False  # True → excluded from HPWL (large constant, can't be optimised)
+    weight: float = 1.0        # HPWL weight in the total cost (constraint-file net priority)
 
 
 @dataclass
@@ -204,6 +211,14 @@ class BoardModel:
     component_groups: List[ComponentGroup] = field(default_factory=list)
     # Map from fp_index → group index (None if not grouped)
     fp_to_group: Dict[int, int] = field(default_factory=dict)
+    # Constraint-file state (set by constraints.apply_constraints; None = none).
+    # Plain None defaults are class attributes, so old pickles keep working.
+    # Footprint indices with an edge_lock (fast membership test in moves).
+    edge_locked_indices: Optional[Set[int]] = None
+    # Soft cohesion groups: list of (group_id, member_indices, max_span_nm).
+    soft_groups: Optional[List[Tuple[str, List[int], int]]] = None
+    # Zone preferences: fp_index -> preferred zone rect (xmin, ymin, xmax, ymax) in nm.
+    zone_prefs: Optional[Dict[int, Tuple[float, float, float, float]]] = None
 
 
 def extract_board_model(board, selected_only: bool = False) -> BoardModel:
@@ -493,7 +508,11 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
     try:
         import pcbnew as _pcbnew
         poly_set = _pcbnew.SHAPE_POLY_SET()
-        board.GetBoardPolygonOutlines(poly_set)
+        try:
+            # KiCad 10 added a required aInferOutlineIfNecessary argument.
+            board.GetBoardPolygonOutlines(poly_set, True)
+        except TypeError:
+            board.GetBoardPolygonOutlines(poly_set)  # KiCad 7 to 9 signature
         if poly_set.OutlineCount() > 0:
             outline = poly_set.Outline(0)
             pts = []
