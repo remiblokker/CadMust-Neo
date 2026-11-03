@@ -7,8 +7,9 @@ import random
 # Add project root to path so we can import the plugin package
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from plugin.board_model import BoardModel, Footprint, Pad, Net, KeepOut, ComponentGroup
-from plugin.cost_function import CostState, point_in_polygon
+from plugin.board_model import (BoardModel, Footprint, Pad, Net, KeepOut,
+                                ComponentGroup, merge_pad_rects)
+from plugin.cost_function import CostState, point_in_polygon, _CongestionGrid
 from plugin.moves import do_translate, do_swap, do_rotate, revert_move, affected_indices
 from plugin.annealer import run_sa, SAConfig
 from plugin.silkscreen import TextRect, SilkscreenModel, place_silkscreen, SILK_CLEARANCE
@@ -127,6 +128,67 @@ class TestCostFunction(unittest.TestCase):
         model.footprints[1].y = model.footprints[0].y
         cs = CostState(model)
         self.assertGreater(cs.total_cost, float(cs.hpwl))
+
+    def test_merge_pad_rects(self):
+        # A 1×14 pin-header row at 2.54mm pitch merges into one strip
+        row = [(int(i * 2.54 * MM) - MM, -MM, int(i * 2.54 * MM) + MM, MM)
+               for i in range(14)]
+        merged = merge_pad_rects(row)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0], (-MM, -MM, int(13 * 2.54 * MM) + MM, MM))
+        # Two well-separated pads (e.g. opposite corners) stay separate
+        corners = [(0, 0, 2 * MM, 2 * MM),
+                   (20 * MM, 20 * MM, 22 * MM, 22 * MM)]
+        self.assertEqual(len(merge_pad_rects(corners)), 2)
+        # Chain merging reaches a fixed point: middle pad bridges two others
+        # (1.5mm gaps, below the 2mm merge threshold)
+        chain = [(0, 0, MM, MM),
+                 (int(2.5 * MM), 0, int(3.5 * MM), MM),
+                 (5 * MM, 0, 6 * MM, MM)]
+        self.assertEqual(merge_pad_rects(chain), [(0, 0, 6 * MM, MM)])
+
+    def test_through_hole_pads_block_opposite_side(self):
+        model = make_test_model()
+        # Back-side footprint with a through-hole pad row (e.g. pin header)
+        # stacked on a front-side footprint: TH pads drill through, so the
+        # pair must still collide — but only on the TH pad area.
+        fp0, fp1 = model.footprints[0], model.footprints[1]
+        fp1.x, fp1.y = fp0.x, fp0.y
+        fp1.is_front = False
+        fp1.th_rects = [(-1 * MM, -MM // 2, 1 * MM, MM // 2)]
+        cs = CostState(model)
+        th_penalty = cs._pair_overlaps.get((0, 1), 0.0)
+        self.assertGreater(th_penalty, 0.0)
+        # TH-only collision is smaller than the full body-vs-body overlap
+        fp1.is_front = True
+        cs_same_side = CostState(model)
+        self.assertGreater(cs_same_side._pair_overlaps[(0, 1)], th_penalty)
+        # Incremental path must agree with full recompute
+        fp1.is_front = False
+        cs = CostState(model)
+        fp0.x += 5 * MM
+        cs.incremental_update({0})
+        fp0.x -= 5 * MM
+        new_cost = cs.incremental_update({0})
+        cs_full = CostState(model)
+        self.assertAlmostEqual(new_cost, cs_full.total_cost, delta=1.0)
+
+    def test_no_overlap_penalty_across_board_sides(self):
+        model = make_test_model()
+        # Stack two footprints, but mount one on the back side (e.g. a
+        # display module) — it must not block front-side placement.
+        model.footprints[1].x = model.footprints[0].x
+        model.footprints[1].y = model.footprints[0].y
+        model.footprints[1].is_front = False
+        cs = CostState(model)
+        self.assertAlmostEqual(cs.total_cost, float(cs.hpwl), delta=1.0)
+        # Incremental path must agree: move fp0 onto fp1 again after a detour
+        model.footprints[0].x += 5 * MM
+        cs.incremental_update({0})
+        model.footprints[0].x -= 5 * MM
+        new_cost = cs.incremental_update({0})
+        cs_full = CostState(model)
+        self.assertAlmostEqual(new_cost, cs_full.total_cost, delta=1.0)
 
     def test_incremental_matches_full(self):
         model = make_test_model()
@@ -844,6 +906,134 @@ class TestGroupMoves(unittest.TestCase):
         new_dist = ((fp1.x - fp0.x)**2 + (fp1.y - fp0.y)**2) ** 0.5
         self.assertAlmostEqual(new_dist, orig_dist, delta=100,
                               msg="Group member distance preserved after SA")
+
+
+class TestCongestionGrid(unittest.TestCase):
+    """Tests for the congestion-aware cost term."""
+
+    def test_grid_creation(self):
+        """Grid dimensions match board size and bin size."""
+        grid = _CongestionGrid(ox=0, oy=0, board_w=50*MM, board_h=40*MM,
+                               bin_size=2*MM)
+        self.assertEqual(grid.nx, 25)  # 50mm / 2mm
+        self.assertEqual(grid.ny, 20)  # 40mm / 2mm
+        self.assertEqual(len(grid.demand), 25 * 20)
+        self.assertEqual(len(grid.capacity), 25 * 20)
+        self.assertTrue(all(d == 0 for d in grid.demand))
+
+    def test_bbox_to_bins_single(self):
+        """A small bbox covers exactly the expected bins."""
+        grid = _CongestionGrid(ox=0, oy=0, board_w=10*MM, board_h=10*MM,
+                               bin_size=5*MM)
+        # 2x2 grid (0,0) (1,0) (0,1) (1,1)
+        self.assertEqual(grid.nx, 2)
+        self.assertEqual(grid.ny, 2)
+        # bbox fitting entirely in bin (0,0)
+        bins = grid.bbox_to_bins(0, 0, 4*MM, 4*MM)
+        self.assertEqual(bins, [0])  # only bin (0,0)
+        # bbox spanning all 4 bins
+        bins = grid.bbox_to_bins(0, 0, 9*MM, 9*MM)
+        self.assertEqual(sorted(bins), [0, 1, 2, 3])
+
+    def test_demand_add_remove(self):
+        """Adding and removing demand is symmetric."""
+        grid = _CongestionGrid(ox=0, oy=0, board_w=10*MM, board_h=10*MM,
+                               bin_size=5*MM)
+        bins = [0, 1]
+        grid.add_demand(bins)
+        self.assertEqual(grid.demand[0], 1)
+        self.assertEqual(grid.demand[1], 1)
+        grid.remove_demand(bins)
+        self.assertEqual(grid.demand[0], 0)
+        self.assertEqual(grid.demand[1], 0)
+
+    def test_penalty_zero_below_capacity(self):
+        """No penalty when demand <= capacity."""
+        grid = _CongestionGrid(ox=0, oy=0, board_w=10*MM, board_h=10*MM,
+                               bin_size=5*MM)
+        # Capacity per bin with 5mm bins = (5_000_000/400_000)*2*2 = 50
+        grid.add_demand([0])  # demand = 1, well below capacity
+        self.assertEqual(grid.compute_penalty(10.0), 0.0)
+
+    def test_penalty_above_capacity(self):
+        """Quadratic penalty when demand exceeds capacity."""
+        grid = _CongestionGrid(ox=0, oy=0, board_w=10*MM, board_h=10*MM,
+                               bin_size=5*MM)
+        cap = grid._cap_val
+        # Push demand above capacity
+        for _ in range(cap + 3):
+            grid.add_demand([0])
+        # excess = 3, penalty = 3^2 * weight * bin_size
+        penalty = grid.compute_penalty(10.0)
+        expected = 9 * 10.0 * 5*MM
+        self.assertAlmostEqual(penalty, expected, places=0)
+
+    def test_cost_state_disabled(self):
+        """CostState with congestion_weight=0 has no congestion grid."""
+        model = make_test_model()
+        cs = CostState(model, congestion_weight=0.0)
+        self.assertIsNone(cs._cong_grid)
+        self.assertEqual(cs._congestion_penalty, 0.0)
+
+    def test_cost_state_enabled(self):
+        """CostState with congestion enabled creates a grid and computes demand."""
+        model = make_test_model()
+        cs = CostState(model, congestion_weight=10.0,
+                       congestion_bin_size=10*MM)
+        self.assertIsNotNone(cs._cong_grid)
+        grid = cs._cong_grid
+        # Should have net_bins for nets with >= 2 pads (NET1, NET2, NET3)
+        self.assertGreaterEqual(len(grid.net_bins), 3)
+        # Total demand should be > 0
+        self.assertGreater(sum(grid.demand), 0)
+
+    def test_incremental_congestion(self):
+        """Moving a footprint updates congestion incrementally."""
+        model = make_test_model()
+        cs = CostState(model, congestion_weight=10.0,
+                       congestion_bin_size=5*MM)
+        old_penalty = cs._congestion_penalty
+        old_demand = list(cs._cong_grid.demand)
+
+        # Move U1 to a very different position
+        fp0 = model.footprints[0]
+        fp0.x = 40 * MM
+        fp0.y = 30 * MM
+        ai = {0}
+        snap = cs.snapshot(ai)
+        cs.incremental_update(ai)
+
+        # Demand should have changed
+        new_demand = list(cs._cong_grid.demand)
+        self.assertNotEqual(old_demand, new_demand)
+
+        # Restore should bring everything back
+        fp0.x = 10 * MM
+        fp0.y = 10 * MM
+        cs.restore(snap)
+        self.assertAlmostEqual(cs._congestion_penalty, old_penalty, places=0)
+
+    def test_congestion_in_total_cost(self):
+        """Congestion penalty is included in total_cost and normalized_cost."""
+        model = make_test_model()
+        cs_no_cong = CostState(model, congestion_weight=0.0)
+        cs_cong = CostState(model, congestion_weight=10.0,
+                            congestion_bin_size=5*MM)
+        # With congestion, costs should differ if there is any congestion penalty
+        if cs_cong._congestion_penalty > 0:
+            self.assertGreater(cs_cong.normalized_cost,
+                               cs_no_cong.normalized_cost)
+
+    def test_sa_with_congestion(self):
+        """SA runs to completion with congestion enabled."""
+        model = make_test_model()
+        config = SAConfig(
+            max_iterations=10,
+            congestion_weight=10.0,
+            congestion_bin_size=5*MM,
+        )
+        result = run_sa(model, config=config)
+        self.assertGreater(result.total_moves, 0)
 
 
 if __name__ == '__main__':

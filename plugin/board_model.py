@@ -31,6 +31,39 @@ def _is_power_net_name(name: str) -> bool:
 
 # All positions/dimensions in nanometers (KiCad native units: 1 mm = 1_000_000 nm)
 
+# Through-hole pad rects closer than this gap are merged into one rect —
+# large enough to fuse standard header/connector pitches (up to ~3.96mm
+# with typical pad sizes) into a single strip, small enough to keep e.g.
+# DIP rows (7.62mm apart) as separate strips.
+TH_MERGE_GAP = 2_000_000  # 2 mm
+
+
+def merge_pad_rects(rects: List[Tuple[int, int, int, int]],
+                    gap: int = TH_MERGE_GAP) -> List[Tuple[int, int, int, int]]:
+    """Merge rectangles that are within `gap` of each other into their
+    union bbox, repeated until stable. O(k² · passes), k = rect count.
+
+    Turns a pin-header row into one strip while keeping well-separated
+    pads (e.g. corner mounting holes) as individual rects.
+    """
+    rects = list(rects)
+    merged = True
+    while merged:
+        merged = False
+        out: List[Tuple[int, int, int, int]] = []
+        for r in rects:
+            for oi, o in enumerate(out):
+                if (r[0] - gap < o[2] and r[2] + gap > o[0] and
+                        r[1] - gap < o[3] and r[3] + gap > o[1]):
+                    out[oi] = (min(r[0], o[0]), min(r[1], o[1]),
+                               max(r[2], o[2]), max(r[3], o[3]))
+                    merged = True
+                    break
+            else:
+                out.append(r)
+        rects = out
+    return rects
+
 @dataclass
 class Pad:
     """A single pad on a footprint."""
@@ -68,6 +101,13 @@ class Footprint:
     net_codes: Set[int] = field(default_factory=set)
     cx_offset: int = 0         # bbox center x offset from fp origin at 0° (nm)
     cy_offset: int = 0         # bbox center y offset from fp origin at 0° (nm)
+    uuid_str: str = ""         # KiCad footprint UUID (unique even with duplicate refs)
+    is_front: bool = True      # False = mounted on the back side (B.Cu)
+    # Merged rects covering through-hole pads, local coords at 0° rotation
+    # relative to the fp origin (empty = all-SMD footprint). TH pads exist
+    # on both board sides, so these rects also block the opposite side
+    # (unlike the body bbox).
+    th_rects: List[Tuple[int, int, int, int]] = field(default_factory=list)
     # Cached trig values for abs_position (updated via set_angle)
     _cos_a: float = field(init=False, repr=False, default=1.0)
     _sin_a: float = field(init=False, repr=False, default=0.0)
@@ -101,6 +141,28 @@ class Footprint:
         else:
             hw, hh = self.width // 2, self.height // 2
         return (cx - hw, cy - hh, cx + hw, cy + hh)
+
+    @property
+    def th_bboxes(self) -> List[Tuple[int, int, int, int]]:
+        """World-space rects of through-hole pad clusters (empty if all-SMD).
+
+        Same rotation handling as bbox, applied per rect. TH pads (and
+        NPTH holes) drill through the board, so these areas are occupied
+        on both sides.
+        """
+        out = []
+        swap = int(self.angle_deg) % 180 == 90
+        for (x1, y1, x2, y2) in self.th_rects:
+            rcx = (x1 + x2) // 2
+            rcy = (y1 + y2) // 2
+            cx = self.x + int(rcx * self._cos_a - rcy * self._sin_a)
+            cy = self.y + int(rcx * self._sin_a + rcy * self._cos_a)
+            if swap:
+                hw, hh = (y2 - y1) // 2, (x2 - x1) // 2
+            else:
+                hw, hh = (x2 - x1) // 2, (y2 - y1) // 2
+            out.append((cx - hw, cy - hh, cx + hw, cy + hh))
+        return out
 
 
 @dataclass
@@ -173,6 +235,11 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
         # Initialise to None; set from first pad or courtyard data.
         ext_xmin = ext_xmax = ext_ymin = ext_ymax = None
 
+        # Per-pad rects for through-hole pads (incl. NPTH holes) — these
+        # occupy both board sides, unlike the SMD body. Merged into
+        # cluster rects after the pad loop.
+        th_pad_rects: List[Tuple[int, int, int, int]] = []
+
         # KiCad uses CW rotation (Y-down), so un-rotate with +angle
         # (not -angle) to recover canonical 0° pad offsets.
         rad = math.radians(angle)
@@ -206,6 +273,21 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
                 ext_ymin = min(ext_ymin, offset_y - pad_half)
                 ext_ymax = max(ext_ymax, offset_y + pad_half)
 
+            # Through-hole detection: HasHole() (KiCad 8+), fall back to
+            # a nonzero drill size on older APIs.
+            try:
+                has_hole = pad.HasHole()
+            except AttributeError:
+                drill = pad.GetDrillSize()
+                has_hole = drill.x > 0 or drill.y > 0
+            if has_hole:
+                th_pad_rects.append((
+                    offset_x - pad_half - PAD_MARGIN,
+                    offset_y - pad_half - PAD_MARGIN,
+                    offset_x + pad_half + PAD_MARGIN,
+                    offset_y + pad_half + PAD_MARGIN,
+                ))
+
             p = Pad(
                 net_code=nc,
                 net_name=pad.GetNetname(),
@@ -219,75 +301,71 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
                 if nc not in nets:
                     nets[nc] = Net(net_code=nc, net_name=pad.GetNetname())
 
-        # Also expand extents from the courtyard outline.
-        # fp.GraphicalItems() includes FP_SHAPE items on F_CrtYd / B_CrtYd.
-        # Their GetStart()/GetEnd() coordinates are in BOARD (world) space,
-        # so we apply the same (translate → un-rotate) transform used for pads
-        # above to get footprint-local (0°) coordinates.
-        # This catches components (inductors, connectors) whose body extends
-        # well beyond their pad extents.
+        # Also expand extents from outline graphics.
+        # Prefer F_CrtYd/B_CrtYd; fall back to F_Fab/B_Fab for footprints
+        # that omit a courtyard (the fab outline reflects the physical body).
         try:
             import pcbnew as _pcbnew
-            for item in fp.GraphicalItems():
-                if item.GetLayer() not in (_pcbnew.F_CrtYd, _pcbnew.B_CrtYd):
-                    continue
-                pts_world = []
-                try:
-                    # For circles, GetStart() is the center and GetEnd() is a point on the perimeter.
-                    # Just adding them would only bound a single quadrant! 
-                    is_circle = False
-                    if hasattr(item, 'GetShape'):
-                        shape_val = item.GetShape()
-                        is_circle = shape_val in (getattr(_pcbnew, 'S_CIRCLE', -1), getattr(_pcbnew, 'SHAPE_T_CIRCLE', -1))
-                    
-                    if is_circle and hasattr(item, 'GetCenter') and hasattr(item, 'GetRadius'):
-                        c = item.GetCenter()
-                        r = item.GetRadius()
-                        class Pt:
-                            def __init__(self, x, y):
-                                self.x = x
-                                self.y = y
-                        
-                        # Calculate local center coordinates
-                        tx_c = c.x - pos.x
-                        ty_c = c.y - pos.y
-                        lcx = tx_c * cos_a - ty_c * sin_a
-                        lcy = tx_c * sin_a + ty_c * cos_a
-                        
-                        # Generate world points that un-rotate perfectly to the local 2r x 2r bounding box
-                        def local_to_world(lx, ly):
-                            return Pt(pos.x + lx * cos_a + ly * sin_a, pos.y - lx * sin_a + ly * cos_a)
-                            
-                        pts_world.append(local_to_world(lcx - r, lcy - r))
-                        pts_world.append(local_to_world(lcx + r, lcy - r))
-                        pts_world.append(local_to_world(lcx - r, lcy + r))
-                        pts_world.append(local_to_world(lcx + r, lcy + r))
-                    else:
-                        pts_world.append(item.GetStart())
-                        pts_world.append(item.GetEnd())
-                except AttributeError:
-                    pass
-                try:
-                    shape = item.GetPolyShape()
-                    if shape.OutlineCount() > 0:
-                        outline = shape.Outline(0)
-                        for vi in range(outline.PointCount()):
-                            pts_world.append(outline.CPoint(vi))
-                except AttributeError:
-                    pass
-                for pt in pts_world:
-                    tx = pt.x - pos.x
-                    ty = pt.y - pos.y
-                    lx = int(tx * cos_a - ty * sin_a)
-                    ly = int(tx * sin_a + ty * cos_a)
-                    if ext_xmin is None:
-                        ext_xmin = lx; ext_xmax = lx
-                        ext_ymin = ly; ext_ymax = ly
-                    else:
-                        ext_xmin = min(ext_xmin, lx); ext_xmax = max(ext_xmax, lx)
-                        ext_ymin = min(ext_ymin, ly); ext_ymax = max(ext_ymax, ly)
+            ext_snap = (ext_xmin, ext_ymin, ext_xmax, ext_ymax)  # snapshot before graphics
+            for layer_set in (
+                (_pcbnew.F_CrtYd, _pcbnew.B_CrtYd),
+                (_pcbnew.F_Fab,   _pcbnew.B_Fab),
+            ):
+                for item in fp.GraphicalItems():
+                    if item.GetLayer() not in layer_set:
+                        continue
+                    pts_world = []
+                    try:
+                        is_circle = False
+                        if hasattr(item, 'GetShape'):
+                            shape_val = item.GetShape()
+                            is_circle = shape_val in (getattr(_pcbnew, 'S_CIRCLE', -1), getattr(_pcbnew, 'SHAPE_T_CIRCLE', -1))
+                        if is_circle and hasattr(item, 'GetCenter') and hasattr(item, 'GetRadius'):
+                            c = item.GetCenter()
+                            r = item.GetRadius()
+                            class Pt:
+                                def __init__(self, x, y):
+                                    self.x = x
+                                    self.y = y
+                            tx_c = c.x - pos.x
+                            ty_c = c.y - pos.y
+                            lcx = tx_c * cos_a - ty_c * sin_a
+                            lcy = tx_c * sin_a + ty_c * cos_a
+                            def local_to_world(lx, ly):
+                                return Pt(pos.x + lx * cos_a + ly * sin_a, pos.y - lx * sin_a + ly * cos_a)
+                            pts_world.append(local_to_world(lcx - r, lcy - r))
+                            pts_world.append(local_to_world(lcx + r, lcy - r))
+                            pts_world.append(local_to_world(lcx - r, lcy + r))
+                            pts_world.append(local_to_world(lcx + r, lcy + r))
+                        else:
+                            pts_world.append(item.GetStart())
+                            pts_world.append(item.GetEnd())
+                    except AttributeError:
+                        pass
+                    try:
+                        shape = item.GetPolyShape()
+                        if shape.OutlineCount() > 0:
+                            outline = shape.Outline(0)
+                            for vi in range(outline.PointCount()):
+                                pts_world.append(outline.CPoint(vi))
+                    except AttributeError:
+                        pass
+                    for pt in pts_world:
+                        tx = pt.x - pos.x
+                        ty = pt.y - pos.y
+                        lx = int(tx * cos_a - ty * sin_a)
+                        ly = int(tx * sin_a + ty * cos_a)
+                        if ext_xmin is None:
+                            ext_xmin = lx; ext_xmax = lx
+                            ext_ymin = ly; ext_ymax = ly
+                        else:
+                            ext_xmin = min(ext_xmin, lx); ext_xmax = max(ext_xmax, lx)
+                            ext_ymin = min(ext_ymin, ly); ext_ymax = max(ext_ymax, ly)
+                # Stop after courtyard if it contributed anything
+                if (ext_xmin, ext_ymin, ext_xmax, ext_ymax) != ext_snap:
+                    break
         except Exception:
-            pass  # courtyard graphics not available; pad extents alone are used
+            pass  # graphics not available; pad extents alone are used
 
         if ext_xmin is None:
             ext_xmin = ext_xmax = ext_ymin = ext_ymax = 0
@@ -306,7 +384,19 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
         fp_cx_offset = (ext_xmin + ext_xmax) // 2
         fp_cy_offset = (ext_ymin + ext_ymax) // 2
 
+        # Merge per-pad TH rects into cluster rects (header row → one strip,
+        # well-separated pads → individual rects)
+        fp_th_rects = merge_pad_rects(th_pad_rects)
+
         is_locked = fp.IsLocked() or (selected_only and not fp.IsSelected())
+        try:
+            uuid = fp.m_Uuid.AsString()
+        except Exception:
+            uuid = ""
+        try:
+            is_front = not fp.IsFlipped()
+        except Exception:
+            is_front = True
         f = Footprint(
             reference=fp.GetReference(),
             index=i,
@@ -320,6 +410,9 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
             locked=is_locked,
             pads=pads_list,
             net_codes=fp_net_codes,
+            uuid_str=uuid,
+            is_front=is_front,
+            th_rects=fp_th_rects,
         )
         footprints.append(f)
 
@@ -353,15 +446,10 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
     fp_to_group: Dict[int, int] = {}
     try:
         import pcbnew as _pcbnew
-        # Build UUID → footprint index map
-        uuid_to_idx: Dict[str, int] = {}
-        for fp_obj in board.GetFootprints():
-            uid = str(fp_obj.m_Uuid.AsString())
-            ref = fp_obj.GetReference()
-            for f in footprints:
-                if f.reference == ref:
-                    uuid_to_idx[uid] = f.index
-                    break
+        # Build UUID → footprint index map (uuid_str is now stored on Footprint)
+        uuid_to_idx: Dict[str, int] = {
+            f.uuid_str: f.index for f in footprints if f.uuid_str
+        }
 
         for grp in board.Groups():
             member_uuids = []

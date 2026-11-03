@@ -8,8 +8,8 @@ __pycache__/
 
 # Plugin runtime artifacts
 plugin/settings.json
-plugin/debug.log
-plugin/profile.log
+plugin/debug*.log
+plugin/profile*.log
 
 # IDE
 .vscode/
@@ -24,3 +24,6 @@ tests/sample_boards/
 # Internal development docs (kept locally, not published)
 CLAUDE.md
 docs/
+
+# Local scripts and tooling (not part of the plugin)
+scripts/

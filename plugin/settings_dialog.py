@@ -44,6 +44,9 @@ _DEFAULTS: Dict[str, Any] = {
     "penalty_scale_min": 0.10,
     "num_starts": 1,
     "move_selected_only": False,
+    "congestion_enabled": False,
+    "congestion_weight": 2.0,
+    "congestion_bin_size": 5.0,   # mm (converted to nm before passing to SAConfig)
 }
 
 
@@ -172,6 +175,19 @@ class SettingsDialog(wx.Dialog):
             "Select components first in KiCad, then run the optimizer."
         )
         main_sizer.Add(self._chk_selected_only, 0,
+                       wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        # --- Congestion ---
+        self._chk_congestion = wx.CheckBox(
+            self, label="Reduce routing congestion")
+        self._chk_congestion.SetToolTip(
+            "When checked, the optimizer penalises areas where too many nets\n"
+            "pass through the same region — producing placements that are\n"
+            "easier to route.\n\n"
+            "Adds a small amount of computation per move."
+        )
+        self._chk_congestion.Bind(wx.EVT_CHECKBOX, self._on_congestion_toggle)
+        main_sizer.Add(self._chk_congestion, 0,
                        wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         # --- Parameters box (Normal + Expert) ---
@@ -312,6 +328,57 @@ class SettingsDialog(wx.Dialog):
             ),
         )
 
+        # Congestion weight — Normal + Expert, only when congestion enabled
+        def _make_slider(val, lo, hi, step, tooltip=""):
+            """Create a slider + numeric readout panel (no grid/list side effects)."""
+            panel = wx.Panel(self)
+            panel_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            multiplier = round(1.0 / step)
+            slider = wx.Slider(
+                panel,
+                minValue=round(lo * multiplier),
+                maxValue=round(hi * multiplier),
+                value=round(val * multiplier),
+                style=wx.SL_HORIZONTAL,
+            )
+            slider.SetToolTip(tooltip)
+            vl = wx.StaticText(panel, label=f"{val:.2f}",
+                               size=wx.Size(36, -1),
+                               style=wx.ALIGN_RIGHT)
+            panel_sizer.Add(slider, 1, wx.ALIGN_CENTER_VERTICAL)
+            panel_sizer.Add(vl, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 6)
+            panel.SetSizer(panel_sizer)
+            def _on_slide(evt, _s=slider, _m=multiplier, _vl=vl):
+                _vl.SetLabel(f"{_s.GetValue() / _m:.2f}")
+            slider.Bind(wx.EVT_SLIDER, _on_slide)
+            panel.GetValue = lambda _s=slider, _m=multiplier: _s.GetValue() / _m
+            panel.SetValue = lambda v, _s=slider, _vl=vl, _m=multiplier: (
+                _s.SetValue(round(v * _m)), _vl.SetLabel(f"{v:.2f}"))
+            return panel
+
+        cw_tip = ("Strength of the routing congestion penalty.\n"
+                  "Higher values spread nets more evenly across the board.\n"
+                  "Default 10.0 works well for most boards.")
+        self._congestion_weight_label = wx.StaticText(
+            self, label="Congestion weight:")
+        self._congestion_weight_label.SetToolTip(cw_tip)
+        self._spin_congestion_weight = _make_slider(2.0, 1.0, 50.0, 1.0,
+                                                    tooltip=cw_tip)
+        grid.Add(self._congestion_weight_label, 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self._spin_congestion_weight, 0, wx.EXPAND)
+
+        # Congestion bin size — Expert only, only when congestion enabled
+        cb_tip = ("Size of the routing grid bins in mm.\n"
+                  "Smaller bins = finer congestion estimation.\n"
+                  "Default 2.0 mm is a good starting point.")
+        self._congestion_bin_label = wx.StaticText(
+            self, label="Congestion bin (mm):")
+        self._congestion_bin_label.SetToolTip(cb_tip)
+        self._spin_congestion_bin = _make_slider(5.0, 1.0, 10.0, 0.5,
+                                                 tooltip=cb_tip)
+        grid.Add(self._congestion_bin_label, 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self._spin_congestion_bin, 0, wx.EXPAND)
+
         self._spin_num_starts_label = wx.StaticText(
             self, label="Multi-start runs:")
         self._spin_num_starts_label.SetToolTip(
@@ -414,6 +481,9 @@ class SettingsDialog(wx.Dialog):
         self._spin_penalty_scale.SetValue(float(s.get("penalty_scale_min", 0.10)))
         self._spin_num_starts.SetValue(int(s.get("num_starts", 1)))
         self._chk_selected_only.SetValue(bool(s.get("move_selected_only", False)))
+        self._chk_congestion.SetValue(bool(s.get("congestion_enabled", False)))
+        self._spin_congestion_weight.SetValue(float(s.get("congestion_weight", 10.0)))
+        self._spin_congestion_bin.SetValue(float(s.get("congestion_bin_size", 2.0)))
 
     def _on_preset_change(self, evt):
         """When preset changes in Expert mode, update the parameter controls."""
@@ -452,6 +522,14 @@ class SettingsDialog(wx.Dialog):
         for ctrl in self._expert_ctrls:
             ctrl.Show(show_expert)
 
+        # Congestion controls — checkbox always visible,
+        # weight+label in Normal+Expert, bin size+label in Expert only
+        congestion_on = self._chk_congestion.GetValue()
+        self._congestion_weight_label.Show(show_params and congestion_on)
+        self._spin_congestion_weight.Show(show_params and congestion_on)
+        self._congestion_bin_label.Show(show_expert and congestion_on)
+        self._spin_congestion_bin.Show(show_expert and congestion_on)
+
         # Net exclusion — Normal + Expert only
         if self._net_sizer is not None:
             self._net_sizer.GetStaticBox().Show(show_params)
@@ -461,6 +539,10 @@ class SettingsDialog(wx.Dialog):
 
         self.Layout()
         self.Fit()
+
+    def _on_congestion_toggle(self, evt):
+        """Show/hide congestion weight and bin size based on checkbox state."""
+        self._on_mode_change(None)
 
     @property
     def move_selected_only(self) -> bool:
@@ -510,6 +592,15 @@ class SettingsDialog(wx.Dialog):
             config.cooling_slow = self._spin_cool_slow.GetValue()
             config.penalty_scale_min = self._spin_penalty_scale.GetValue()
             config.num_starts = self._spin_num_starts.GetValue()
+
+        # Congestion (all modes)
+        if self._chk_congestion.GetValue():
+            config.congestion_weight = self._spin_congestion_weight.GetValue()
+            config.congestion_bin_size = int(
+                self._spin_congestion_bin.GetValue() * 1_000_000)
+        else:
+            config.congestion_weight = 0.0
+
         return config
 
     def _on_ok(self, evt):
@@ -527,6 +618,9 @@ class SettingsDialog(wx.Dialog):
             "penalty_scale_min": self._spin_penalty_scale.GetValue(),
             "num_starts": self._spin_num_starts.GetValue(),
             "move_selected_only": self._chk_selected_only.GetValue(),
+            "congestion_enabled": self._chk_congestion.GetValue(),
+            "congestion_weight": self._spin_congestion_weight.GetValue(),
+            "congestion_bin_size": self._spin_congestion_bin.GetValue(),
         }
         save_settings(data)
         self.EndModal(wx.ID_OK)

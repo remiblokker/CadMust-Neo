@@ -1,4 +1,5 @@
-"""Cost function: HPWL + overlap penalty + boundary penalty + keep-out penalty.
+"""Cost function: HPWL + overlap penalty + boundary penalty + keep-out penalty
++ optional congestion penalty.
 
 Supports incremental updates: when footprints move, only affected pairs/items
 are recomputed, reducing per-move cost from O(n²) to O(n).
@@ -6,13 +7,17 @@ are recomputed, reducing per-move cost from O(n²) to O(n).
 Overlap detection uses flat bbox arrays plus a sorted xmin list for O(log n + k)
 neighbor scans, where k is the number of footprints whose left edge is left of
 the query's right edge. The bisect narrows the scan vs the previous O(n) flat scan.
+
+Congestion estimation divides the board into routing bins and counts how many net
+bounding boxes cross each bin.  Bins where demand exceeds capacity incur a
+quadratic penalty.  Disabled when congestion_weight == 0 (zero overhead).
 """
 from __future__ import annotations
 
 import bisect
 import math
 import time
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from .board_model import BoardModel, Net
 
 
@@ -23,6 +28,117 @@ POLYGON_BOUNDARY_WEIGHT = 500.0  # polygon cutout violations (nm); 10× BOUNDARY
                             # weight equals OVERLAP_WEIGHT — preventing SA from trading
                             # cutout placement for overlap relief even at high temperature.
 KEEPOUT_WEIGHT = 100.0      # per-violation, multiplied by overlap distance (nm)
+
+# Default congestion bin capacity: assumes 2-layer board, 0.4mm track pitch,
+# both horizontal and vertical routing.  capacity = (bin_size / pitch) * layers * 2.
+_DEFAULT_CONGESTION_LAYERS = 2
+_DEFAULT_TRACK_PITCH_NM = 400_000  # 0.4 mm
+
+
+class _CongestionGrid:
+    """Uniform routing-demand grid for congestion estimation.
+
+    The board is divided into rectangular bins of *bin_size* nm.  For each
+    non-excluded net with >= 2 pads, the HPWL bounding box determines which
+    bins the net's routing crosses.  Each covered bin gets +1 demand.  Bins
+    where demand > capacity incur a quadratic penalty.
+
+    All state is stored in flat Python lists for C-level indexing speed.
+    """
+
+    __slots__ = ('bin_size', 'nx', 'ny', 'ox', 'oy',
+                 'demand', 'capacity', 'net_bins', '_cap_val')
+
+    def __init__(self, ox: int, oy: int, board_w: int, board_h: int,
+                 bin_size: int, layers: int = _DEFAULT_CONGESTION_LAYERS):
+        self.bin_size = bin_size
+        self.ox = ox
+        self.oy = oy
+        self.nx = max(1, (board_w + bin_size - 1) // bin_size)
+        self.ny = max(1, (board_h + bin_size - 1) // bin_size)
+        n_bins = self.nx * self.ny
+        self.demand: List[int] = [0] * n_bins
+        # Capacity per bin
+        self._cap_val = max(1, int(
+            (bin_size / _DEFAULT_TRACK_PITCH_NM) * layers * 2
+        ))
+        self.capacity: List[int] = [self._cap_val] * n_bins
+        # net_code -> list of bin indices covered by its HPWL bbox
+        self.net_bins: Dict[int, List[int]] = {}
+
+    def bbox_to_bins(self, xmin: int, ymin: int,
+                     xmax: int, ymax: int) -> List[int]:
+        """Return list of bin indices covered by a bounding box."""
+        bs = self.bin_size
+        bx0 = max(0, (xmin - self.ox) // bs)
+        by0 = max(0, (ymin - self.oy) // bs)
+        bx1 = min(self.nx - 1, (xmax - self.ox) // bs)
+        by1 = min(self.ny - 1, (ymax - self.oy) // bs)
+        nx = self.nx
+        bins = []
+        for by in range(by0, by1 + 1):
+            row = by * nx
+            for bx in range(bx0, bx1 + 1):
+                bins.append(row + bx)
+        return bins
+
+    def add_demand(self, bins: List[int]) -> None:
+        """Increment demand for each bin in the list."""
+        demand = self.demand
+        for b in bins:
+            demand[b] += 1
+
+    def remove_demand(self, bins: List[int]) -> None:
+        """Decrement demand for each bin in the list."""
+        demand = self.demand
+        for b in bins:
+            demand[b] -= 1
+
+    def compute_penalty(self, weight: float) -> float:
+        """Sum quadratic excess penalty across all bins.
+
+        penalty = sum( max(0, demand - capacity)^2 ) * weight * bin_size
+        """
+        demand = self.demand
+        cap = self.capacity
+        total = 0
+        for i in range(len(demand)):
+            excess = demand[i] - cap[i]
+            if excess > 0:
+                total += excess * excess
+        return total * weight * self.bin_size
+
+    def remove_demand_delta(self, bins: List[int], weight: float) -> float:
+        """Remove demand from bins and return the penalty delta."""
+        demand = self.demand
+        cap = self.capacity
+        delta = 0
+        for b in bins:
+            old_d = demand[b]
+            old_e = old_d - cap[b]
+            new_e = old_e - 1
+            demand[b] = old_d - 1
+            if old_e > 0:
+                delta -= old_e * old_e
+            if new_e > 0:
+                delta += new_e * new_e
+        return delta * weight * self.bin_size
+
+    def add_demand_delta(self, bins: List[int], weight: float) -> float:
+        """Add demand to bins and return the penalty delta."""
+        demand = self.demand
+        cap = self.capacity
+        delta = 0
+        for b in bins:
+            old_d = demand[b]
+            old_e = old_d - cap[b]
+            new_e = old_e + 1
+            demand[b] = old_d + 1
+            if old_e > 0:
+                delta -= old_e * old_e
+            if new_e > 0:
+                delta += new_e * new_e
+        return delta * weight * self.bin_size
 
 
 def point_in_polygon(px: int, py: int,
@@ -108,14 +224,19 @@ class CostState:
     are cached so incremental updates are O(n) instead of O(n²).
     """
 
-    def __init__(self, model: BoardModel, quiet: bool = False):
+    def __init__(self, model: BoardModel, quiet: bool = False,
+                 congestion_weight: float = 0.0,
+                 congestion_bin_size: int = 5_000_000):
         self.model = model
         self.net_hpwl: Dict[int, int] = {}
         self._total_hpwl: int = 0
         self._overlap_penalty: float = 0.0
         self._boundary_penalty: float = 0.0
         self._keepout_penalty: float = 0.0
-        self.penalty_scale: float = 1.0  # scales boundary+keepout (not overlap)
+        self._congestion_penalty: float = 0.0
+        self._congestion_weight: float = congestion_weight
+        self._congestion_bin_size: int = congestion_bin_size
+        self.penalty_scale: float = 1.0  # scales boundary+keepout+congestion (not overlap)
 
         # Caches for incremental updates
         self._pair_overlaps: Dict[Tuple[int, int], float] = {}
@@ -136,6 +257,7 @@ class CostState:
         self.t_overlap = 0.0
         self.t_boundary = 0.0
         self.t_keepout = 0.0
+        self.t_congestion = 0.0
         self.t_snapshot = 0.0
 
         # Precomputed per-footprint net scale (max(1, len(net_codes))).
@@ -143,6 +265,18 @@ class CostState:
         self._fp_net_scale: List[int] = [
             max(1, len(fp.net_codes)) for fp in model.footprints
         ]
+
+        # Precomputed per-footprint board side. Phase 1 has no flip move, so
+        # sides never change during a run. getattr default keeps pickled
+        # BoardModels from before the is_front field working (batch corpus).
+        self._fp_is_front: List[bool] = [
+            getattr(fp, 'is_front', True) for fp in model.footprints
+        ]
+        # Backfill through-hole rects on models pickled before they existed,
+        # so the th_bboxes property works without per-call getattr.
+        for fp in model.footprints:
+            if not hasattr(fp, 'th_rects'):
+                fp.th_rects = []
 
         # Cached board extents — avoid self.model.X attribute chain in hot path.
         self._oxmin: int = model.outline_xmin
@@ -164,6 +298,16 @@ class CostState:
             poly = None  # treat as rectangular: bbox check is sufficient
         self._outline_polygon = poly
 
+        # Congestion grid — None when disabled (zero overhead)
+        self._cong_grid: Optional[_CongestionGrid] = None
+        if congestion_weight > 0:
+            board_w = model.outline_xmax - model.outline_xmin
+            board_h = model.outline_ymax - model.outline_ymin
+            self._cong_grid = _CongestionGrid(
+                model.outline_xmin, model.outline_ymin,
+                board_w, board_h, congestion_bin_size,
+            )
+
         # Log excluded power nets once at startup (suppressed for preview runs)
         if not quiet:
             power_nets = [net for net in model.nets.values() if net.is_excluded]
@@ -171,6 +315,11 @@ class CostState:
                 names = ', '.join(n.net_name for n in power_nets[:10])
                 suffix = f' (+{len(power_nets)-10} more)' if len(power_nets) > 10 else ''
                 print(f'[CadMust] Excluding {len(power_nets)} power net(s) from HPWL: {names}{suffix}')
+            if self._cong_grid is not None:
+                g = self._cong_grid
+                print(f'[CadMust] Congestion grid: {g.nx}x{g.ny} bins, '
+                      f'{congestion_bin_size/1e6:.1f}mm bin size, '
+                      f'capacity {g._cap_val}/bin, weight {congestion_weight}')
 
         self._compute_all()
 
@@ -221,6 +370,31 @@ class CostState:
             if ay > ymax: ymax = ay
         return int(xmax - xmin) + int(ymax - ymin)
 
+    def _compute_net_hpwl_bbox(self, net: Net):
+        """Compute HPWL and bounding box in a single pad iteration.
+
+        Returns (hpwl, (xmin, ymin, xmax, ymax)) or (0, None).
+        Used when congestion is enabled to avoid duplicate pad iteration.
+        """
+        if net.is_excluded or len(net.pad_refs) < 2:
+            return 0, None
+        fps = self.model.footprints
+        xmin = ymin = float('inf')
+        xmax = ymax = float('-inf')
+        for fi, pi in net.pad_refs:
+            fp = fps[fi]
+            pad = fp.pads[pi]
+            cos_a = fp._cos_a
+            sin_a = fp._sin_a
+            ax = fp.x + int(pad.offset_x * cos_a - pad.offset_y * sin_a)
+            ay = fp.y + int(pad.offset_x * sin_a + pad.offset_y * cos_a)
+            if ax < xmin: xmin = ax
+            if ax > xmax: xmax = ax
+            if ay < ymin: ymin = ay
+            if ay > ymax: ymax = ay
+        return (int(xmax - xmin) + int(ymax - ymin),
+                (int(xmin), int(ymin), int(xmax), int(ymax)))
+
     def _compute_all_hpwl(self):
         self._total_hpwl = 0
         for nc, net in self.model.nets.items():
@@ -233,15 +407,45 @@ class CostState:
         gi = self.model.fp_to_group.get(i)
         return gi is not None and gi == self.model.fp_to_group.get(j)
 
+    @staticmethod
+    def _rect_overlap(a: Tuple[int, int, int, int],
+                      b: Tuple[int, int, int, int]) -> int:
+        """Return ox + oy for two overlapping rects, 0 if disjoint."""
+        ox = min(a[2], b[2]) - max(a[0], b[0])
+        oy = min(a[3], b[3]) - max(a[1], b[1])
+        if ox > 0 and oy > 0:
+            return ox + oy
+        return 0
+
     def _compute_pair_overlap(self, i: int, j: int) -> float:
         """Compute overlap penalty for a single pair (i, j).
+
+        Pairs on opposite board sides collide only via through-hole pads:
+        a back-side component's body does not occupy front-side area (e.g.
+        a display module mounted on the back must not block front-side
+        placement), but its TH pads drill through and block both sides.
 
         Skips pairs in the same component group — the designer placed
         them intentionally and the group moves as a rigid body.
         """
+        fps = self.model.footprints
+        if self._fp_is_front[i] != self._fp_is_front[j]:
+            if self._same_group(i, j):
+                return 0.0
+            total = 0
+            th_j = fps[j].th_bboxes
+            if th_j:
+                bbox_i = fps[i].bbox
+                for r in th_j:
+                    total += self._rect_overlap(bbox_i, r)
+            th_i = fps[i].th_bboxes
+            if th_i:
+                bbox_j = fps[j].bbox
+                for r in th_i:
+                    total += self._rect_overlap(r, bbox_j)
+            return total * OVERLAP_WEIGHT
         if self._same_group(i, j):
             return 0.0
-        fps = self.model.footprints
         x1min, y1min, x1max, y1max = fps[i].bbox
         x2min, y2min, x2max, y2max = fps[j].bbox
         ox = max(0, min(x1max, x2max) - max(x1min, x2min))
@@ -339,12 +543,82 @@ class CostState:
                 total += v
         return total
 
+    # --- Congestion ---
+
+    def _compute_net_bbox(self, net: Net):
+        """Return (xmin, ymin, xmax, ymax) of pad positions, or None."""
+        if net.is_excluded or len(net.pad_refs) < 2:
+            return None
+        fps = self.model.footprints
+        xmin = ymin = float('inf')
+        xmax = ymax = float('-inf')
+        for fi, pi in net.pad_refs:
+            fp = fps[fi]
+            pad = fp.pads[pi]
+            cos_a = fp._cos_a
+            sin_a = fp._sin_a
+            ax = fp.x + int(pad.offset_x * cos_a - pad.offset_y * sin_a)
+            ay = fp.y + int(pad.offset_x * sin_a + pad.offset_y * cos_a)
+            if ax < xmin: xmin = ax
+            if ax > xmax: xmax = ax
+            if ay < ymin: ymin = ay
+            if ay > ymax: ymax = ay
+        return (int(xmin), int(ymin), int(xmax), int(ymax))
+
+    def _build_congestion(self) -> None:
+        """Build congestion grid demand from scratch."""
+        grid = self._cong_grid
+        if grid is None:
+            return
+        # Reset demand
+        for i in range(len(grid.demand)):
+            grid.demand[i] = 0
+        grid.net_bins.clear()
+        # Populate from all nets
+        for nc, net in self.model.nets.items():
+            bbox = self._compute_net_bbox(net)
+            if bbox is None:
+                continue
+            bins = grid.bbox_to_bins(*bbox)
+            grid.net_bins[nc] = bins
+            grid.add_demand(bins)
+        self._congestion_penalty = grid.compute_penalty(self._congestion_weight)
+
+    def _update_congestion(self, affected_nets: Set[int],
+                           net_bboxes: Dict[int, Optional[Tuple[int, int, int, int]]]) -> None:
+        """Incrementally update congestion for nets whose pads moved.
+
+        Uses per-bin penalty deltas instead of rescanning all bins.
+        net_bboxes: pre-computed from the HPWL pass (avoids duplicate pad iteration).
+        """
+        grid = self._cong_grid
+        if grid is None:
+            return
+        weight = self._congestion_weight
+        penalty = self._congestion_penalty
+        for nc in affected_nets:
+            # Remove old demand (with delta tracking)
+            old_bins = grid.net_bins.get(nc)
+            if old_bins is not None:
+                penalty += grid.remove_demand_delta(old_bins, weight)
+            # Use pre-computed bbox
+            bbox = net_bboxes.get(nc)
+            if bbox is None:
+                if old_bins is not None:
+                    del grid.net_bins[nc]
+                continue
+            new_bins = grid.bbox_to_bins(*bbox)
+            grid.net_bins[nc] = new_bins
+            penalty += grid.add_demand_delta(new_bins, weight)
+        self._congestion_penalty = penalty
+
     def _compute_all(self):
         self._rebuild_bbox_arrays()
         self._compute_all_hpwl()
         self._overlap_penalty = self._compute_overlap_penalty()
         self._boundary_penalty = self._compute_boundary_penalty()
         self._keepout_penalty = self._compute_keepout_penalty()
+        self._build_congestion()
 
     def update_penalty_scale(self, scale: float) -> None:
         """Set the penalty scale for boundary and keepout penalties.
@@ -355,9 +629,10 @@ class CostState:
 
     @property
     def total_cost(self) -> float:
-        """Cost with current penalty_scale applied to boundary+keepout."""
+        """Cost with current penalty_scale applied to boundary+keepout+congestion."""
         return (float(self._total_hpwl) + self._overlap_penalty
-                + (self._boundary_penalty + self._keepout_penalty)
+                + (self._boundary_penalty + self._keepout_penalty
+                   + self._congestion_penalty)
                 * self.penalty_scale)
 
     @property
@@ -368,7 +643,8 @@ class CostState:
         regardless of when they were found during the anneal.
         """
         return (float(self._total_hpwl) + self._overlap_penalty
-                + self._boundary_penalty + self._keepout_penalty)
+                + self._boundary_penalty + self._keepout_penalty
+                + self._congestion_penalty)
 
     @property
     def hpwl(self) -> int:
@@ -401,12 +677,26 @@ class CostState:
             saved_bbox[fi] = (self._bx1[fi], self._by1[fi],
                               self._bx2[fi], self._by2[fi])
 
+        # Save congestion state for affected nets
+        saved_congestion = None
+        grid = self._cong_grid
+        if grid is not None:
+            saved_net_bins = {}
+            for nc in affected_nets:
+                old_bins = grid.net_bins.get(nc)
+                saved_net_bins[nc] = list(old_bins) if old_bins is not None else None
+            saved_congestion = {
+                'penalty': self._congestion_penalty,
+                'net_bins': saved_net_bins,
+            }
+
         self.t_snapshot += time.perf_counter() - _ts
         return {
             'hpwl': self._total_hpwl,
             'overlap': self._overlap_penalty,
             'boundary': self._boundary_penalty,
             'keepout': self._keepout_penalty,
+            'congestion': saved_congestion,
             'net_hpwl': {nc: self.net_hpwl.get(nc, 0) for nc in affected_nets},
             'pair_overlaps': saved_pairs,
             'fp_boundary': {fi: self._fp_boundary.get(fi, 0.0) for fi in moved_fp_indices},
@@ -449,6 +739,24 @@ class CostState:
             else:
                 self._fp_keepout.pop(fi, None)
 
+        # Restore congestion grid state: undo the incremental update by
+        # removing current (post-move) demand and re-adding old (pre-move) demand.
+        saved_cong = snap.get('congestion')
+        if saved_cong is not None and self._cong_grid is not None:
+            grid = self._cong_grid
+            self._congestion_penalty = saved_cong['penalty']
+            for nc, old_bins in saved_cong['net_bins'].items():
+                # Remove demand that was added by incremental_update
+                cur_bins = grid.net_bins.get(nc)
+                if cur_bins is not None:
+                    grid.remove_demand(cur_bins)
+                # Restore old net_bins and demand
+                if old_bins is not None:
+                    grid.net_bins[nc] = old_bins
+                    grid.add_demand(old_bins)
+                else:
+                    grid.net_bins.pop(nc, None)
+
         # Restore bbox arrays and sorted xmin list (footprint positions already reverted)
         for fi, bbox in snap.get('saved_bbox', {}).items():
             # Remove current (post-move) xmin from sorted list
@@ -476,18 +784,33 @@ class CostState:
         n = len(fps)
 
         # --- HPWL (incremental, nets only; power nets excluded) ---
+        # When congestion is enabled, compute bbox alongside HPWL in one
+        # pad iteration (avoids duplicate _compute_net_bbox calls).
         _t0 = time.perf_counter()
         affected_nets: Set[int] = set()
         for fi in moved_fp_indices:
             affected_nets.update(fps[fi].net_codes)
-        for nc in affected_nets:
-            net = self.model.nets[nc]
-            if net.is_excluded:
-                continue
-            old_h = self.net_hpwl.get(nc, 0)
-            new_h = self._compute_net_hpwl(net)
-            self._total_hpwl += (new_h - old_h)
-            self.net_hpwl[nc] = new_h
+        cong_enabled = self._cong_grid is not None
+        net_bboxes: Dict[int, Optional[Tuple[int, int, int, int]]] = {}
+        if cong_enabled:
+            for nc in affected_nets:
+                net = self.model.nets[nc]
+                if net.is_excluded:
+                    continue
+                old_h = self.net_hpwl.get(nc, 0)
+                new_h, bbox = self._compute_net_hpwl_bbox(net)
+                self._total_hpwl += (new_h - old_h)
+                self.net_hpwl[nc] = new_h
+                net_bboxes[nc] = bbox
+        else:
+            for nc in affected_nets:
+                net = self.model.nets[nc]
+                if net.is_excluded:
+                    continue
+                old_h = self.net_hpwl.get(nc, 0)
+                new_h = self._compute_net_hpwl(net)
+                self._total_hpwl += (new_h - old_h)
+                self.net_hpwl[nc] = new_h
         _t1 = time.perf_counter()
         self.t_hpwl += _t1 - _t0
 
@@ -555,6 +878,12 @@ class CostState:
             if new_v > 0:
                 self._fp_keepout[fi] = new_v
             self._keepout_penalty += new_v
-        self.t_keepout += time.perf_counter() - _t3
+        _t4 = time.perf_counter()
+        self.t_keepout += _t4 - _t3
+
+        # --- Congestion (incremental, affected nets only) ---
+        if self._cong_grid is not None:
+            self._update_congestion(affected_nets, net_bboxes)
+            self.t_congestion += time.perf_counter() - _t4
 
         return self.total_cost

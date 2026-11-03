@@ -3,6 +3,7 @@ reheating, and greedy refinement."""
 from __future__ import annotations
 
 import math
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,9 @@ class SAConfig:
     reheat_ratio: float = 0.30       # reheat to this fraction of T0
 
     num_starts: int = 1              # multi-start: total independent runs (1 = classic single-run)
+
+    congestion_weight: float = 0.0   # 0 = disabled; ~2.0 for moderate congestion avoidance
+    congestion_bin_size: int = 5_000_000  # routing bin size in nm (5mm default)
 
     callback_interval: float = 0.33  # seconds between UI updates (~3/sec)
 
@@ -534,7 +538,6 @@ def run_sa(
     if config is None:
         config = SAConfig()
 
-    import os
     n_moveable = len(model.moveable_indices)
     if config.moves_per_temp == 0:
         moves_per_temp = max(10 * n_moveable, 50)
@@ -552,12 +555,15 @@ def run_sa(
     initial_positions = _snapshot_positions(model)
 
     # Evaluate initial placement cost (start 0 uses this as starting point)
-    cost_state = CostState(model)
+    cost_state = CostState(model,
+                           congestion_weight=config.congestion_weight,
+                           congestion_bin_size=config.congestion_bin_size)
     initial_cost = cost_state.total_cost
 
-    # Global best across all starts
-    global_best_cost = cost_state.normalized_cost
-    global_best_hpwl = float(cost_state.hpwl)
+    # Global best across all starts — initialised to +inf so the first start
+    # always wins regardless of the pre-kickout starting cost.
+    global_best_cost = float("inf")
+    global_best_hpwl = float("inf")
     global_best_positions = _snapshot_positions(model)
 
     cost_history: List[Tuple[int, float]] = [(0, global_best_cost)]
@@ -582,7 +588,9 @@ def run_sa(
             _scatter_positions(model)
 
         # Fresh cost state for this start
-        cost_state = CostState(model)
+        cost_state = CostState(model,
+                               congestion_weight=config.congestion_weight,
+                               congestion_bin_size=config.congestion_bin_size)
 
         # Calibrate T0 for this starting placement
         t0 = auto_calibrate_t0(model, cost_state, config)
@@ -651,6 +659,7 @@ def run_sa(
 
     # --- Phase 3: greedy refinement on global best ---
     _restore_positions(model, global_best_positions)
+
     cost_state._compute_all()
     cost_state.update_penalty_scale(1.0)
 
@@ -679,6 +688,7 @@ def run_sa(
         global_best_cost = final_cost
         global_best_hpwl = float(cost_state.hpwl)
 
+
     # --- Write profile summary to log file ---
     total_time = time.perf_counter() - run_t0
     sa_time = total_time - greedy_time
@@ -697,6 +707,7 @@ def run_sa(
             f"      Overlap:        {cost_state.t_overlap:7.1f}s",
             f"      Boundary:       {cost_state.t_boundary:7.1f}s",
             f"      Keepout:        {cost_state.t_keepout:7.1f}s",
+            f"      Congestion:     {cost_state.t_congestion:7.1f}s",
             f"    Revert+update:    {profile.revert:7.1f}s  ({profile.revert/sa_time*100:.0f}%)",
             f"    UI callback:      {profile.callback:7.1f}s  ({profile.callback/sa_time*100:.0f}%)",
         ]
