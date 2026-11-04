@@ -25,5 +25,4 @@ tests/sample_boards/
 CLAUDE.md
 docs/
 
-# Local scripts and tooling (not part of the plugin)
-scripts/
+# scripts/ is tracked since 2026-11-04: CadMust-Autopilot depends on batch_runner.py

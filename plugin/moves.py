@@ -536,6 +536,13 @@ def do_rotate(model: BoardModel) -> MoveUndo:
     mi = random.choice(model.moveable_indices)
     members = _get_group_members(model, mi)
 
+    # Edge-locked parts (connectors, antennas) keep the orientation the
+    # designer gave them: a connector must still face outward.  Rotating
+    # such a part is never a useful move, so return a no-op the annealer
+    # will accept at zero delta.
+    if model.edge_locked_indices and _members_edge_locked(model, members):
+        return MoveUndo(move_type="rotate")
+
     undo = MoveUndo(move_type="rotate")
     for idx in members:
         fp = model.footprints[idx]

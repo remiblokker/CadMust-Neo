@@ -645,5 +645,25 @@ class TestScatterFirstStart(unittest.TestCase):
             annealer._scatter_positions = orig
 
 
-if __name__ == '__main__':
+class TestEdgeLockedRotation(unittest.TestCase):
+    """Edge-locked parts keep their orientation (decision 2026-11-04)."""
+
+    def test_rotate_is_noop_for_edge_locked_part(self):
+        m = make_model()
+        apply(m, base_constraints(placement_constraints={
+            "edge_locked": [{"ref": "R0", "edge": "left"}]}))
+        idx = next(i for i, fp in enumerate(m.footprints) if fp.reference == "R0")
+        before = (m.footprints[idx].x, m.footprints[idx].y, m.footprints[idx].angle_deg)
+        random.seed(1)
+        for _ in range(50):
+            saved = m.moveable_indices
+            m.moveable_indices = [idx]
+            undo = do_rotate(m)
+            m.moveable_indices = saved
+            self.assertEqual(undo.old_states, [])
+        after = (m.footprints[idx].x, m.footprints[idx].y, m.footprints[idx].angle_deg)
+        self.assertEqual(before, after)
+
+
+if __name__ == "__main__":
     unittest.main()
