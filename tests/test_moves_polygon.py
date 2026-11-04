@@ -245,7 +245,7 @@ def _inside_bbox(m, f):
 
 
 class TestMovesStayOnBoard(unittest.TestCase):
-    """translate, median and swap clamp the moved parts to the outline bbox.
+    """offboard="clamp": translate, median and swap clamp the moved parts to the outline bbox.
     Before, SA could park parts off the board, where only the cheap bbox
     boundary term applied, and the post-SA kickout pushed them back blindly."""
 
@@ -263,7 +263,7 @@ class TestMovesStayOnBoard(unittest.TestCase):
         random.seed(4)
         on_edge = 0
         for _ in range(200):
-            do_translate(m, 1.0, 30 * MM)
+            do_translate(m, 1.0, 30 * MM, "clamp")
             f = m.footprints[0]
             self.assertTrue(_inside_bbox(m, f), msg=f.bbox)
             on_edge += f.bbox[0] == OX or f.bbox[2] == OX + BW or \
@@ -282,7 +282,7 @@ class TestMovesStayOnBoard(unittest.TestCase):
         m.nets = {1: Net(net_code=1, net_name="N", pad_refs=[(0, 0), (1, 0)])}
         random.seed(1)
         for _ in range(50):
-            do_median(m, 0.0, 0)
+            do_median(m, 0.0, 0, "clamp")
             self.assertTrue(_inside_bbox(m, m.footprints[0]))
         self.assertEqual(m.footprints[0].bbox[0], OX)
 
@@ -293,7 +293,7 @@ class TestMovesStayOnBoard(unittest.TestCase):
         small = fpx("C1", 1, 58.5, 20, 2, 1)
         m = self._model([big, small], 2)
         random.seed(0)
-        undo = do_swap(m)
+        undo = do_swap(m, "clamp")
         self.assertIsNotNone(undo)
         for f in m.footprints:
             self.assertTrue(_inside_bbox(m, f), msg=(f.reference, f.bbox))
@@ -305,10 +305,71 @@ class TestMovesStayOnBoard(unittest.TestCase):
         m = make_model(L_POLY)
         random.seed(8)
         for _ in range(200):
-            do_translate(m, 1.0, 40 * MM)
+            do_translate(m, 1.0, 40 * MM, "clamp")
             for i in range(m.footprints.__len__() - 1):
                 self.assertTrue(_inside_bbox(m, m.footprints[i]),
                                 msg=m.footprints[i].reference)
+
+
+class TestOffboardReject(unittest.TestCase):
+    """offboard="reject": a move that would leave the outline bbox is undone
+    and comes back as an empty "rejected" MoveUndo."""
+
+    def _model(self, fps, n_moveable):
+        for i, f in enumerate(fps):
+            f.index = i
+        return BoardModel(footprints=fps, nets={}, outline_xmin=OX, outline_ymin=OY,
+                          outline_xmax=OX + BW, outline_ymax=OY + BH,
+                          moveable_indices=list(range(n_moveable)))
+
+    def test_translate_off_board_is_rejected_unchanged(self):
+        m = self._model([fpx("R0", 0, 4, 20)], 1)
+        random.seed(4)
+        n_rej = 0
+        for _ in range(200):
+            before = (m.footprints[0].x, m.footprints[0].y)
+            undo = do_translate(m, 1.0, 30 * MM, "reject")
+            f = m.footprints[0]
+            self.assertTrue(_inside_bbox(m, f))
+            if undo.move_type == "rejected":
+                n_rej += 1
+                self.assertEqual(undo.old_states, [])
+                self.assertEqual((f.x, f.y), before)
+            else:
+                # accepted moves are never pulled onto the edge
+                self.assertNotEqual(f.bbox[0], OX)
+        self.assertGreater(n_rej, 20)
+
+    def test_part_already_off_may_move_back(self):
+        m = self._model([fpx("R0", 0, -5, 20)], 1)  # 8 mm off the left edge
+        random.seed(3)
+        for _ in range(100):
+            do_translate(m, 1.0, 3 * MM, "reject")
+        self.assertGreater(m.footprints[0].x, OX - 5 * MM)
+
+    def test_swap_off_board_is_rejected(self):
+        big = fpx("U1", 0, 20, 20, 20, 20)
+        small = fpx("C1", 1, 58.5, 20, 2, 1)
+        m = self._model([big, small], 2)
+        random.seed(0)
+        undo = do_swap(m, "reject")
+        self.assertEqual(undo.move_type, "rejected")
+        self.assertEqual((m.footprints[0].x, m.footprints[1].x),
+                         (OX + 20 * MM, OX + int(58.5 * MM)))
+
+    def test_sa_reject_keeps_cost_consistent(self):
+        m = make_model(L_POLY)
+        cfg = SAConfig(max_iterations=30, reheat_count=1, scatter_first_start=True,
+                       seed=5, offboard="reject")
+        res = run_sa(m, config=cfg)
+        cs = CostState(m, quiet=True)
+        self.assertAlmostEqual(res.final_cost, cs.total_cost, delta=1e-6 * abs(cs.total_cost) + 1)
+        for f in m.footprints[:-1]:
+            self.assertTrue(_inside_bbox(m, f), msg=f.reference)
+
+    def test_bad_mode_raises(self):
+        with self.assertRaises(ValueError):
+            run_sa(make_model(None), config=SAConfig(max_iterations=2, offboard="wrap"))
 
 
 class TestRectangularUnchanged(unittest.TestCase):

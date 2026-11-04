@@ -56,6 +56,13 @@ class SAConfig:
 
     callback_interval: float = 0.33  # seconds between UI updates (~3/sec)
 
+    # What translate/median/swap do with a move that would take a part off
+    # the outline bbox: "reject" the move (default; counted as attempted and
+    # not accepted, no cost bookkeeping) or "clamp" it onto the board edge.
+    # Reject keeps the proposal distribution unbiased; clamp lands every
+    # off-board proposal exactly on the edge.
+    offboard: str = "reject"
+
 
 @dataclass
 class SAResult:
@@ -99,11 +106,11 @@ def auto_calibrate_t0(
     for _ in range(config.calibration_samples):
         mt = select_move_type(1.0)
         if mt == "translate":
-            undo = do_translate(model, 1.0, calib_window)
+            undo = do_translate(model, 1.0, calib_window, config.offboard)
         elif mt == "median":
-            undo = do_median(model, 1.0, calib_noise)
+            undo = do_median(model, 1.0, calib_noise, config.offboard)
         elif mt == "swap":
-            undo = do_swap(model)
+            undo = do_swap(model, config.offboard)
             if undo is None:
                 continue
         else:
@@ -206,6 +213,10 @@ def _sa_phase(
     n_reverts = 0
     last_callback_time = time.perf_counter()
 
+    offboard = config.offboard
+    if offboard not in ("clamp", "reject"):
+        raise ValueError("SAConfig.offboard must be 'clamp' or 'reject', not %r" % offboard)
+
     while temperature > config.min_temperature and step < max_steps:
         # Update penalty_scale for this temperature step
         t_ratio = _compute_t_ratio(temperature, t0)
@@ -226,17 +237,25 @@ def _sa_phase(
             undo: Optional[MoveUndo] = None
 
             if mt == "translate":
-                undo = do_translate(model, t_ratio, window)
+                undo = do_translate(model, t_ratio, window, offboard)
             elif mt == "median":
-                undo = do_median(model, t_ratio, noise)
+                undo = do_median(model, t_ratio, noise, offboard)
             elif mt == "swap":
-                undo = do_swap(model)
+                undo = do_swap(model, offboard)
                 if undo is None:
                     continue
             else:
                 undo = do_rotate(model)
             _t1 = time.perf_counter()
             t_move_gen += _t1 - _t0
+
+            if undo.move_type == "rejected":
+                # offboard="reject": the move was undone inside the move
+                # function; nothing to update, count it as not accepted.
+                attempted += 1
+                n_reverts += 1
+                total_moves += 1
+                continue
 
             attempted += 1
             ai = affected_indices(undo)

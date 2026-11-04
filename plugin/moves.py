@@ -202,6 +202,45 @@ def _clamp_group_to_board(model: BoardModel, members: List[int]) -> None:
             model.footprints[idx].y += cy
 
 
+OFFBOARD_MODES = ("clamp", "reject")
+
+
+def _group_bbox_excess(model: BoardModel, members: List[int]) -> int:
+    """Sum over members of how far (nm) each bbox leaves the outline bbox."""
+    fps = model.footprints
+    xmin, ymin = model.outline_xmin, model.outline_ymin
+    xmax, ymax = model.outline_xmax, model.outline_ymax
+    total = 0
+    for idx in members:
+        x1, y1, x2, y2 = fps[idx].bbox
+        total += (max(0, xmin - x1) + max(0, x2 - xmax)
+                  + max(0, ymin - y1) + max(0, y2 - ymax))
+    return total
+
+
+def _rejected(model: BoardModel, undo: "MoveUndo") -> "MoveUndo":
+    """Undo a move in place and return an empty MoveUndo ("rejected"): no
+    footprint is affected, so the annealer's snapshot/update/revert
+    bookkeeping has nothing to do."""
+    revert_move(model, undo)
+    return MoveUndo(move_type="rejected")
+
+
+def _offboard_rejects(model: BoardModel, members: List[int], pre_excess: int,
+                      offboard: str) -> bool:
+    """offboard="reject": resnap edge locks, then True when the move leaves
+    the outline bbox further than the group already was (pre_excess), so a
+    part that is already off (scatter, perturb, rotate) may still move back.
+    offboard="clamp": clamp + resnap (_keep_on_board), never rejects."""
+    if offboard == "reject":
+        if model.edge_locked_indices:
+            resnap_edges(model, members)
+        post = _group_bbox_excess(model, members)
+        return post > 0 and post > pre_excess
+    _keep_on_board(model, members)
+    return False
+
+
 def _keep_on_board(model: BoardModel, members: List[int]) -> None:
     """Clamp a moved group to the outline bbox, then re-snap edge locks.
 
@@ -440,7 +479,8 @@ def _compute_t_ratio(temperature: float, t0: float) -> float:
     return 0.0
 
 
-def do_translate(model: BoardModel, t_ratio: float, window: int) -> MoveUndo:
+def do_translate(model: BoardModel, t_ratio: float, window: int,
+                 offboard: str = "reject") -> MoveUndo:
     """
     Translate a random moveable footprint (and its group) by a
     temperature-dependent distance.
@@ -458,18 +498,21 @@ def do_translate(model: BoardModel, t_ratio: float, window: int) -> MoveUndo:
 
     dx = random.randint(-window, window)
     dy = random.randint(-window, window)
+    pre = _group_bbox_excess(model, members) if offboard == "reject" else 0
 
     for idx in members:
         fp = model.footprints[idx]
         fp.x += dx
         fp.y += dy
 
-    _keep_on_board(model, members)
+    if _offboard_rejects(model, members, pre, offboard):
+        return _rejected(model, undo)
 
     return undo
 
 
-def do_median(model: BoardModel, t_ratio: float, noise: int) -> MoveUndo:
+def do_median(model: BoardModel, t_ratio: float, noise: int,
+              offboard: str = "reject") -> MoveUndo:
     """
     Move a footprint toward the weighted center of its connected pads.
 
@@ -492,6 +535,7 @@ def do_median(model: BoardModel, t_ratio: float, noise: int) -> MoveUndo:
     for idx in members:
         fp = model.footprints[idx]
         undo.old_states.append((idx, fp.x, fp.y, fp.angle_deg))
+    pre = _group_bbox_excess(model, members) if offboard == "reject" else 0
 
     # Compute centroid of connected pads (excluding our own footprints)
     sum_x = 0
@@ -524,7 +568,8 @@ def do_median(model: BoardModel, t_ratio: float, noise: int) -> MoveUndo:
         for idx in members:
             fps[idx].x += dx
             fps[idx].y += dy
-        _keep_on_board(model, members)
+        if _offboard_rejects(model, members, pre, offboard):
+            return _rejected(model, undo)
         return undo
 
     target_x = sum_x // count
@@ -553,12 +598,13 @@ def do_median(model: BoardModel, t_ratio: float, noise: int) -> MoveUndo:
         fp.x += dx
         fp.y += dy
 
-    _keep_on_board(model, members)
+    if _offboard_rejects(model, members, pre, offboard):
+        return _rejected(model, undo)
 
     return undo
 
 
-def do_swap(model: BoardModel) -> Optional[MoveUndo]:
+def do_swap(model: BoardModel, offboard: str = "reject") -> Optional[MoveUndo]:
     """Swap positions of two random moveable footprints (or groups).
 
     If both are ungrouped, swap their positions directly.
@@ -592,6 +638,11 @@ def do_swap(model: BoardModel) -> Optional[MoveUndo]:
     for idx in members1 + members2:
         fp = model.footprints[idx]
         undo.old_states.append((idx, fp.x, fp.y, fp.angle_deg))
+    if offboard == "reject":
+        pre1 = _group_bbox_excess(model, members1)
+        pre2 = _group_bbox_excess(model, members2)
+    else:
+        pre1 = pre2 = 0
 
     # Compute centroids
     cx1 = sum(model.footprints[i].x for i in members1) // len(members1)
@@ -610,10 +661,12 @@ def do_swap(model: BoardModel) -> Optional[MoveUndo]:
         model.footprints[idx].y -= dy
 
     # A large part swapped into a small part's spot near the edge would
-    # stick out: clamp each side. Swaps never involve edge-locked parts, so
-    # the resnap inside _keep_on_board is a no-op here.
-    _keep_on_board(model, members1)
-    _keep_on_board(model, members2)
+    # stick out: clamp each side (or reject the swap). Swaps never involve
+    # edge-locked parts, so the edge resnap is a no-op here.
+    r1 = _offboard_rejects(model, members1, pre1, offboard)
+    r2 = _offboard_rejects(model, members2, pre2, offboard)
+    if r1 or r2:
+        return _rejected(model, undo)
 
     return undo
 

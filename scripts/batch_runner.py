@@ -216,6 +216,8 @@ def apply_overrides(config: SAConfig, args) -> SAConfig:
         config.cohesion_weight = args.cohesion_weight
     if args.zone_weight is not None:
         config.zone_weight = args.zone_weight
+    if getattr(args, "offboard", None) is not None:
+        config.offboard = args.offboard
     return config
 
 
@@ -285,6 +287,7 @@ def run_single_model(args, cset) -> int:
         "seed": config.seed,
         "cohesion_weight": config.cohesion_weight,
         "zone_weight": config.zone_weight,
+        "offboard": config.offboard,
     }
     if args.out:
         out = Path(args.out)
@@ -360,6 +363,9 @@ def main():
                         help="Weight of the soft group-cohesion term (default 1.0, 0 disables)")
     parser.add_argument("--zone-weight", type=float, default=None,
                         help="Weight of the soft zone-preference term (default 1.0, 0 disables)")
+    parser.add_argument("--offboard", choices=("clamp", "reject"), default=None,
+                        help="Moves that would leave the outline bbox: reject them "
+                             "(default) or clamp them onto the edge")
     args = parser.parse_args()
 
     cset = None
