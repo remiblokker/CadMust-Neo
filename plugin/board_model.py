@@ -183,11 +183,20 @@ class Net:
 
 @dataclass
 class KeepOut:
-    """A rectangular keep-out zone."""
+    """A rectangular footprint keep-out zone (bbox of a KiCad rule area).
+
+    ``layers`` records the copper layers the rule area is on: ``"all"`` when
+    it covers both outer copper layers (or none could be read), otherwise the
+    comma-joined layer names, e.g. ``"F.Cu"``. The cost function and the move
+    filter still treat every keep-out as applying to both sides; the field is
+    there so a single-layer keep-out can later apply to that side only. Old
+    pickles without the field read the class default ``"all"``.
+    """
     xmin: int
     ymin: int
     xmax: int
     ymax: int
+    layers: str = "all"
 
 
 @dataclass
@@ -219,6 +228,59 @@ class BoardModel:
     soft_groups: Optional[List[Tuple[str, List[int], int]]] = None
     # Zone preferences: fp_index -> preferred zone rect (xmin, ymin, xmax, ymax) in nm.
     zone_prefs: Optional[Dict[int, Tuple[float, float, float, float]]] = None
+
+
+def _rule_area_forbids_footprints(zone) -> bool:
+    """True when a KiCad rule area forbids footprints.
+
+    KiCad 6+ exposes ``GetDoNotAllowFootprints()``. A zone object without
+    that method (very old KiCad, or a stub) is treated as a footprint
+    keep-out, which was the behaviour before this filter existed.
+    """
+    getter = getattr(zone, "GetDoNotAllowFootprints", None)
+    if getter is None:
+        return True
+    try:
+        return bool(getter())
+    except Exception:
+        return True
+
+
+def _rule_area_layers(board, zone) -> str:
+    """Copper layers of a rule area as ``"all"`` or comma-joined names."""
+    try:
+        names = [board.GetLayerName(l) for l in zone.GetLayerSet().Seq()]
+    except Exception:
+        return "all"
+    names = [n for n in names if n.endswith(".Cu")]
+    if not names or ("F.Cu" in names and "B.Cu" in names):
+        return "all"
+    return ",".join(sorted(names))
+
+
+def extract_keepouts(board) -> List[KeepOut]:
+    """Footprint keep-outs from the board's rule areas, as bboxes.
+
+    Only rule areas that forbid footprints count: a rule area that only
+    forbids copper pour, tracks or vias (e.g. "(copperpour not_allowed)
+    (footprints allowed)" under magnetics or a mains section) says nothing
+    about placement.
+    """
+    keepouts: List[KeepOut] = []
+    for zone in board.Zones():
+        if not (zone.GetIsRuleArea() and _rule_area_forbids_footprints(zone)):
+            continue
+        outline = zone.Outline()
+        if outline:
+            zb = outline.BBox()
+            keepouts.append(KeepOut(
+                xmin=zb.GetX(),
+                ymin=zb.GetY(),
+                xmax=zb.GetX() + zb.GetWidth(),
+                ymax=zb.GetY() + zb.GetHeight(),
+                layers=_rule_area_layers(board, zone),
+            ))
+    return keepouts
 
 
 def extract_board_model(board, selected_only: bool = False) -> BoardModel:
@@ -442,19 +504,7 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
     ox = bbox.GetX()
     oy = bbox.GetY()
 
-    # Extract keep-out zones
-    keepouts: List[KeepOut] = []
-    for zone in board.Zones():
-        if zone.GetIsRuleArea():
-            outline = zone.Outline()
-            if outline:
-                zb = outline.BBox()
-                keepouts.append(KeepOut(
-                    xmin=zb.GetX(),
-                    ymin=zb.GetY(),
-                    xmax=zb.GetX() + zb.GetWidth(),
-                    ymax=zb.GetY() + zb.GetHeight(),
-                ))
+    keepouts = extract_keepouts(board)
 
     # Extract component groups
     component_groups: List[ComponentGroup] = []

@@ -771,6 +771,8 @@ class CostState:
         fxmax = self._bx2[fp_idx]
         fymax = self._by2[fp_idx]
         total = 0.0
+        # Every keep-out applies to both sides for now, also one whose
+        # KeepOut.layers names a single copper layer.
         for ko in self._keepouts:
             ox = max(0, min(fxmax, ko.xmax) - max(fxmin, ko.xmin))
             oy = max(0, min(fymax, ko.ymax) - max(fymin, ko.ymin))

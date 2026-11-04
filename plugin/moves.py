@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple
 from .board_model import BoardModel
 from .cost_function import (point_in_polygon, polygon_edge_limit,
-                            _polygon_is_rectangular)
+                            _polygon_is_rectangular, dist_to_polygon)
 
 
 @dataclass
@@ -202,6 +202,20 @@ def _clamp_group_to_board(model: BoardModel, members: List[int]) -> None:
             model.footprints[idx].y += cy
 
 
+def _keep_on_board(model: BoardModel, members: List[int]) -> None:
+    """Clamp a moved group to the outline bbox, then re-snap edge locks.
+
+    Same order as greedy refine. Without the clamp, SA could park a part
+    off the board: outside the bbox only the cheap BOUNDARY_WEIGHT term
+    applies (the polygon term is skipped there), which is cheaper than an
+    overlap, and the post-SA kickout then pushed such parts back onto
+    whatever sat at the edge.
+    """
+    _clamp_group_to_board(model, members)
+    if model.edge_locked_indices:
+        resnap_edges(model, members)
+
+
 def _hits_new_keepout(model: BoardModel, members: List[int],
                       old_states: List[Tuple[int, int, int, float]]) -> bool:
     """Check if any member entered a keepout zone it wasn't already in.
@@ -247,6 +261,18 @@ def _hits_new_keepout(model: BoardModel, members: List[int],
     return False
 
 
+def _on_board(x: int, y: int, poly: List[Tuple[int, int]]) -> bool:
+    """Point inside the outline polygon or exactly on it.
+
+    point_in_polygon (ray casting) is half-open: a point on the right or
+    bottom outline edge reads as outside. A part clamped to the outline bbox
+    touches those edges exactly, so the polygon tests below accept a
+    distance of 0, as the cost function's polygon term does (it charges 0
+    there).
+    """
+    return point_in_polygon(x, y, poly) or dist_to_polygon(x, y, poly) == 0
+
+
 def _hits_polygon_cutout(model: BoardModel, members: List[int],
                          old_states: List[Tuple[int, int, int, float]]) -> bool:
     """Return True if any member bbox corner moves from inside to outside the board polygon.
@@ -256,9 +282,10 @@ def _hits_polygon_cutout(model: BoardModel, members: List[int],
     function boundary penalty provides the gradient to migrate it back in. Only NEW
     violations (inside → outside) are blocked.
 
-    Returns False immediately if outline_polygon is None (rectangular board).
+    Returns False immediately for a rectangular board (no polygon, or every
+    vertex on the bbox): the bbox clamp already keeps parts on it.
     """
-    poly = model.outline_polygon
+    poly = _edge_snap_polygon(model)
     if poly is None:
         return False
 
@@ -269,7 +296,7 @@ def _hits_polygon_cutout(model: BoardModel, members: List[int],
         x1, y1, x2, y2 = fp.bbox
         new_corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
 
-        new_outside = [not point_in_polygon(nx, ny, poly) for nx, ny in new_corners]
+        new_outside = [not _on_board(nx, ny, poly) for nx, ny in new_corners]
         if not any(new_outside):
             continue
 
@@ -291,7 +318,7 @@ def _hits_polygon_cutout(model: BoardModel, members: List[int],
         ]
 
         for ci, is_new_outside in enumerate(new_outside):
-            if is_new_outside and point_in_polygon(old_corners[ci][0], old_corners[ci][1], poly):
+            if is_new_outside and _on_board(old_corners[ci][0], old_corners[ci][1], poly):
                 return True  # corner was inside, now outside: new violation
 
     return False
@@ -309,9 +336,11 @@ def _kickout_polygon_violations(
     Uses binary search in each of 8 directions to find the minimum displacement that
     gets all corners inside the polygon, then picks the shortest option.
 
-    Returns the number of components that were relocated.
+    Returns the number of components that were relocated. A rectangular
+    board (no polygon, or every vertex on the bbox) is skipped: the moves
+    clamp to the bbox, so nothing can be off it.
     """
-    poly = model.outline_polygon
+    poly = _edge_snap_polygon(model)
     if poly is None:
         return 0
 
@@ -335,7 +364,7 @@ def _kickout_polygon_violations(
             x1, y1, x2, y2 = model.footprints[idx].bbox
             all_corners.extend([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
 
-        if all(point_in_polygon(cx, cy, poly) for cx, cy in all_corners):
+        if all(_on_board(cx, cy, poly) for cx, cy in all_corners):
             continue  # already inside — nothing to do
 
         best_dx, best_dy = None, None
@@ -435,8 +464,7 @@ def do_translate(model: BoardModel, t_ratio: float, window: int) -> MoveUndo:
         fp.x += dx
         fp.y += dy
 
-    if model.edge_locked_indices:
-        resnap_edges(model, members)
+    _keep_on_board(model, members)
 
     return undo
 
@@ -496,8 +524,7 @@ def do_median(model: BoardModel, t_ratio: float, noise: int) -> MoveUndo:
         for idx in members:
             fps[idx].x += dx
             fps[idx].y += dy
-        if model.edge_locked_indices:
-            resnap_edges(model, members)
+        _keep_on_board(model, members)
         return undo
 
     target_x = sum_x // count
@@ -526,8 +553,7 @@ def do_median(model: BoardModel, t_ratio: float, noise: int) -> MoveUndo:
         fp.x += dx
         fp.y += dy
 
-    if model.edge_locked_indices:
-        resnap_edges(model, members)
+    _keep_on_board(model, members)
 
     return undo
 
@@ -582,6 +608,12 @@ def do_swap(model: BoardModel) -> Optional[MoveUndo]:
     for idx in members2:
         model.footprints[idx].x -= dx
         model.footprints[idx].y -= dy
+
+    # A large part swapped into a small part's spot near the edge would
+    # stick out: clamp each side. Swaps never involve edge-locked parts, so
+    # the resnap inside _keep_on_board is a no-op here.
+    _keep_on_board(model, members1)
+    _keep_on_board(model, members2)
 
     return undo
 

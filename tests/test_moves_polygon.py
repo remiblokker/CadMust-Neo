@@ -21,7 +21,7 @@ from plugin.board_model import BoardModel, Footprint, Pad, Net
 from plugin.cost_function import (CostState, polygon_edge_limit,
                                   bbox_outside_polygon, outline_is_polygonal,
                                   point_in_polygon)
-from plugin.moves import (resnap_edges, do_translate, do_median,
+from plugin.moves import (resnap_edges, do_translate, do_median, do_swap,
                           EDGE_LOCK_MARGIN)
 from plugin.annealer import run_sa, SAConfig, _scatter_positions, _perturb_positions
 
@@ -236,6 +236,79 @@ class TestResnapPolygon(unittest.TestCase):
         f = m.footprints[0]
         lim = polygon_edge_limit(L_POLY, "top", f.bbox[0], f.bbox[2])
         self.assertEqual(f.bbox[1], round(lim) + EDGE_LOCK_MARGIN)
+
+
+def _inside_bbox(m, f):
+    x1, y1, x2, y2 = f.bbox
+    return (x1 >= m.outline_xmin and y1 >= m.outline_ymin and
+            x2 <= m.outline_xmax and y2 <= m.outline_ymax)
+
+
+class TestMovesStayOnBoard(unittest.TestCase):
+    """translate, median and swap clamp the moved parts to the outline bbox.
+    Before, SA could park parts off the board, where only the cheap bbox
+    boundary term applied, and the post-SA kickout pushed them back blindly."""
+
+    def _model(self, fps, n_moveable):
+        for i, f in enumerate(fps):
+            f.index = i
+        return BoardModel(footprints=fps, nets={}, outline_xmin=OX, outline_ymin=OY,
+                          outline_xmax=OX + BW, outline_ymax=OY + BH,
+                          moveable_indices=list(range(n_moveable)))
+
+    def test_translate_that_would_leave_the_board_is_clamped(self):
+        # Broken case: R0 sits 1 mm from the left edge, the window is 30 mm,
+        # so about half of the raw moves would put it off the board.
+        m = self._model([fpx("R0", 0, 4, 20)], 1)
+        random.seed(4)
+        on_edge = 0
+        for _ in range(200):
+            do_translate(m, 1.0, 30 * MM)
+            f = m.footprints[0]
+            self.assertTrue(_inside_bbox(m, f), msg=f.bbox)
+            on_edge += f.bbox[0] == OX or f.bbox[2] == OX + BW or \
+                f.bbox[1] == OY or f.bbox[3] == OY + BH
+        self.assertGreater(on_edge, 20)  # the clamp was exercised
+
+    def test_median_towards_an_off_board_anchor_is_clamped(self):
+        # R0 is pulled by a net to a locked part 30 mm left of the board.
+        r0 = fpx("R0", 0, 10, 20)
+        anchor = fpx("A", 1, -30, 20, 2, 2)
+        anchor.locked = True
+        for f in (r0, anchor):
+            f.pads.append(Pad(net_code=1, net_name="N", offset_x=0, offset_y=0))
+            f.net_codes.add(1)
+        m = self._model([r0, anchor], 1)
+        m.nets = {1: Net(net_code=1, net_name="N", pad_refs=[(0, 0), (1, 0)])}
+        random.seed(1)
+        for _ in range(50):
+            do_median(m, 0.0, 0)
+            self.assertTrue(_inside_bbox(m, m.footprints[0]))
+        self.assertEqual(m.footprints[0].bbox[0], OX)
+
+    def test_swap_is_clamped(self):
+        # Broken case: a 20 x 20 mm part swapped onto a small part whose centre
+        # is 1.5 mm from the right edge would stick out 8.5 mm.
+        big = fpx("U1", 0, 20, 20, 20, 20)
+        small = fpx("C1", 1, 58.5, 20, 2, 1)
+        m = self._model([big, small], 2)
+        random.seed(0)
+        undo = do_swap(m)
+        self.assertIsNotNone(undo)
+        for f in m.footprints:
+            self.assertTrue(_inside_bbox(m, f), msg=(f.reference, f.bbox))
+        self.assertEqual(m.footprints[0].bbox[2], OX + BW)
+        self.assertEqual(m.footprints[1].x, OX + 20 * MM)  # the small part is unaffected
+
+    def test_translate_clamp_then_edge_resnap(self):
+        # An edge-locked part is clamped and still sits on its edge after a move.
+        m = make_model(L_POLY)
+        random.seed(8)
+        for _ in range(200):
+            do_translate(m, 1.0, 40 * MM)
+            for i in range(m.footprints.__len__() - 1):
+                self.assertTrue(_inside_bbox(m, m.footprints[i]),
+                                msg=m.footprints[i].reference)
 
 
 class TestRectangularUnchanged(unittest.TestCase):
