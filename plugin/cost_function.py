@@ -222,6 +222,143 @@ def _polygon_is_rectangular(poly: List[Tuple[int, int]],
     return True
 
 
+# ---------------------------------------------------------------------------
+# Outline-polygon edge profiles (edge locks on non-rectangular boards)
+# ---------------------------------------------------------------------------
+#
+# For edge "top" the boundary at a vertical line x is the topmost (smallest y)
+# crossing of that line with the outline polygon. Over a footprint's x-span
+# [x1, x2] the snap target is the innermost (largest y) value of that boundary.
+# "bottom" mirrors it (largest-y crossing, innermost = smallest), and "left" /
+# "right" do the same with x and y swapped. Between two consecutive vertex
+# coordinates the boundary is one polygon edge (a simple polygon has no
+# crossing edges), so the boundary is piecewise linear and the extreme over a
+# span lies at x1, x2 or a vertex coordinate inside it, approached from the
+# side of the interval; this is exact for axis-aligned and diagonal edges.
+# Both the CadMust-Neo edge snap (moves.resnap_edges) and the
+# CadMust-Autopilot checker use this one definition.
+
+_EDGE_PROFILE_CACHE: Dict[Tuple[int, str], Tuple[object, object]] = {}
+
+
+def _build_edge_profile(poly: List[Tuple[int, int]], edge: str):
+    """Return (breakpoints, lines) for one edge of the polygon.
+
+    breakpoints: sorted unique vertex coordinates along the edge direction.
+    lines[i]: (u_a, v_a, u_b, v_b) of the outermost polygon edge over the open
+    interval (breakpoints[i], breakpoints[i+1]), or None if no edge spans it.
+    u runs along the edge (x for top/bottom, y for left/right), v is the
+    perpendicular coordinate.
+    """
+    along_x = edge in ("top", "bottom")
+    pts = [(x, y) if along_x else (y, x) for x, y in poly]
+    outer_is_min = edge in ("top", "left")
+    bps = sorted(set(u for u, _ in pts))
+    segs = []
+    n = len(pts)
+    for i in range(n):
+        ua, va = pts[i]
+        ub, vb = pts[(i + 1) % n]
+        if ua == ub:
+            continue  # parallel to v: no crossing in an open interval
+        if ua > ub:
+            ua, va, ub, vb = ub, vb, ua, va
+        segs.append((ua, va, ub, vb))
+    lines = []
+    for i in range(len(bps) - 1):
+        lo, hi = bps[i], bps[i + 1]
+        mid = (lo + hi) / 2.0
+        best = None
+        best_v = None
+        for s in segs:
+            if s[0] <= lo and s[2] >= hi:
+                v = s[1] + (s[3] - s[1]) * (mid - s[0]) / (s[2] - s[0])
+                if best is None or (v < best_v if outer_is_min else v > best_v):
+                    best, best_v = s, v
+        lines.append(best)
+    return bps, lines
+
+
+def _edge_profile(poly: List[Tuple[int, int]], edge: str):
+    """Cached _build_edge_profile, keyed on id(poly); the cache keeps the
+    polygon object so a recycled id can never return a stale profile."""
+    key = (id(poly), edge)
+    hit = _EDGE_PROFILE_CACHE.get(key)
+    if hit is not None and hit[0] is poly:
+        return hit[1]
+    prof = _build_edge_profile(poly, edge)
+    _EDGE_PROFILE_CACHE[key] = (poly, prof)
+    return prof
+
+
+def polygon_edge_limit(poly: List[Tuple[int, int]], edge: str,
+                       lo: int, hi: int) -> Optional[float]:
+    """Innermost boundary coordinate of the polygon's `edge` side over [lo, hi].
+
+    edge "top"/"bottom": [lo, hi] is an x-span, the result is a y (largest
+    top-boundary y, resp. smallest bottom-boundary y). edge "left"/"right":
+    [lo, hi] is a y-span, the result is an x (largest left-boundary x, resp.
+    smallest right-boundary x). The span is clipped to the polygon's extent;
+    None when it does not overlap the polygon at all.
+    """
+    bps, lines = _edge_profile(poly, edge)
+    if not bps or hi < bps[0] or lo > bps[-1]:
+        return None
+    inner_is_max = edge in ("top", "left")
+    best = None
+    # intervals overlapping [lo, hi]
+    i0 = max(0, bisect.bisect_right(bps, lo) - 1)
+    for i in range(i0, len(lines)):
+        a, b = bps[i], bps[i + 1]
+        if a > hi:
+            break
+        if b < lo:
+            continue
+        s = lines[i]
+        if s is None:
+            continue
+        u1 = a if a > lo else lo
+        u2 = b if b < hi else hi
+        if u1 > u2:
+            continue
+        for u in (u1, u2):
+            v = s[1] + (s[3] - s[1]) * (u - s[0]) / (s[2] - s[0])
+            if best is None or (v > best if inner_is_max else v < best):
+                best = v
+    return best
+
+
+def outline_is_polygonal(model) -> bool:
+    """True when the model's outline polygon differs from its bounding box
+    (an L-shape, notch or bevel). False for no polygon or a rectangle."""
+    poly = getattr(model, "outline_polygon", None)
+    if poly is None:
+        return False
+    return not _polygon_is_rectangular(poly, model.outline_xmin, model.outline_ymin,
+                                       model.outline_xmax, model.outline_ymax)
+
+
+def bbox_outside_polygon(bbox: Tuple[int, int, int, int],
+                         poly: List[Tuple[int, int]]) -> float:
+    """How far a rectangle leaves the polygon (nm); 0.0 when it is inside.
+
+    Outside when a bbox corner lies outside the polygon (excess = that
+    corner's distance to the polygon) or a polygon vertex lies strictly inside
+    the bbox (a notch corner poking in; excess = the vertex's depth, its
+    distance to the nearest bbox side). Returns the largest such excess.
+    """
+    x1, y1, x2, y2 = bbox
+    excess = 0.0
+    for cx, cy in ((x1, y1), (x2, y1), (x2, y2), (x1, y2)):
+        if not point_in_polygon(cx, cy, poly):
+            # a corner exactly on the outline (d == 0) counts as inside
+            excess = max(excess, dist_to_polygon(cx, cy, poly))
+    for vx, vy in poly:
+        if x1 < vx < x2 and y1 < vy < y2:
+            excess = max(excess, float(min(vx - x1, x2 - vx, vy - y1, y2 - vy)))
+    return excess
+
+
 def _pair_key(i: int, j: int) -> Tuple[int, int]:
     return (i, j) if i < j else (j, i)
 

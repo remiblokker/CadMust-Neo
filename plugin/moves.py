@@ -6,7 +6,8 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple
 from .board_model import BoardModel
-from .cost_function import point_in_polygon
+from .cost_function import (point_in_polygon, polygon_edge_limit,
+                            _polygon_is_rectangular)
 
 
 @dataclass
@@ -40,8 +41,29 @@ def _get_group_members(model: BoardModel, fp_index: int) -> List[int]:
     return [fp_index]
 
 
-# Edge-locked footprints sit this far inside their outline-bbox edge.
+# Edge-locked footprints sit this far inside their outline edge.
 EDGE_LOCK_MARGIN = 1_000_000  # 1.0 mm
+
+# id(outline_polygon) -> (polygon, bbox, snap polygon or None). The polygon
+# object is kept so a recycled id never returns a stale entry.
+_SNAP_POLY_CACHE = {}
+
+
+def _edge_snap_polygon(model: BoardModel):
+    """The outline polygon to snap against, or None for a rectangular board
+    (no polygon, or every vertex on the bounding box): then the bbox edge is
+    exact and resnap_edges keeps the original, cheaper arithmetic."""
+    poly = model.outline_polygon
+    if poly is None:
+        return None
+    bb = (model.outline_xmin, model.outline_ymin,
+          model.outline_xmax, model.outline_ymax)
+    hit = _SNAP_POLY_CACHE.get(id(poly))
+    if hit is not None and hit[0] is poly and hit[1] == bb:
+        return hit[2]
+    snap = None if _polygon_is_rectangular(poly, *bb) else poly
+    _SNAP_POLY_CACHE[id(poly)] = (poly, bb, snap)
+    return snap
 
 
 def resnap_edges(model: BoardModel, members: List[int]) -> None:
@@ -51,39 +73,76 @@ def resnap_edges(model: BoardModel, members: List[int]) -> None:
     edge-locked part slides along its edge. The correction is applied to all
     members (a rigid group containing an edge-locked part moves as a whole).
     If several members are edge-locked, the first one per axis decides that
-    axis. The edge is the outline bounding box edge, matching the checker's
-    edge distance definition.
+    axis.
+
+    The edge is the outline POLYGON's boundary at the part's position: for
+    "top", the innermost (largest y) point of the polygon's top boundary over
+    the part's bbox x-span (cost_function.polygon_edge_limit); the other
+    three edges likewise. On an L-shaped board a top-locked part that slides
+    over a notch therefore drops below the notch instead of hanging off the
+    board. The checker (CadMust-Autopilot check_constraints.py) uses the same
+    definition. On a rectangular board (no polygon, or all vertices on the
+    bbox) this is the outline bounding-box edge, computed as before.
+
+    For a rigid group locked on both axes, the x correction is computed
+    first and the y snap uses the x-span after that correction; the x snap
+    itself uses the y-span before the y correction.
     """
     el = model.edge_locked_indices
     if not el:
         return
     fps = model.footprints
-    dx = dy = 0
-    have_x = have_y = False
+    poly = _edge_snap_polygon(model)
+    x_idx = y_idx = None
     for idx in members:
         if idx not in el:
             continue
-        fp = fps[idx]
-        edge = fp.edge_lock
+        edge = fps[idx].edge_lock
         if edge is None:
             continue
+        if edge in ("top", "bottom"):
+            if y_idx is None:
+                y_idx = idx
+        elif edge in ("left", "right"):
+            if x_idx is None:
+                x_idx = idx
+        if x_idx is not None and y_idx is not None:
+            break
+    dx = dy = 0
+    if x_idx is not None:
+        fp = fps[x_idx]
         x1, y1, x2, y2 = fp.bbox
-        if edge == "top":
-            if not have_y:
-                dy = model.outline_ymin + EDGE_LOCK_MARGIN - y1
-                have_y = True
-        elif edge == "bottom":
-            if not have_y:
-                dy = model.outline_ymax - EDGE_LOCK_MARGIN - y2
-                have_y = True
-        elif edge == "left":
-            if not have_x:
-                dx = model.outline_xmin + EDGE_LOCK_MARGIN - x1
-                have_x = True
-        elif edge == "right":
-            if not have_x:
-                dx = model.outline_xmax - EDGE_LOCK_MARGIN - x2
-                have_x = True
+        if fp.edge_lock == "left":
+            ref = model.outline_xmin
+            if poly is not None:
+                lim = polygon_edge_limit(poly, "left", y1, y2)
+                if lim is not None:
+                    ref = int(round(lim))
+            dx = ref + EDGE_LOCK_MARGIN - x1
+        else:
+            ref = model.outline_xmax
+            if poly is not None:
+                lim = polygon_edge_limit(poly, "right", y1, y2)
+                if lim is not None:
+                    ref = int(round(lim))
+            dx = ref - EDGE_LOCK_MARGIN - x2
+    if y_idx is not None:
+        fp = fps[y_idx]
+        x1, y1, x2, y2 = fp.bbox
+        if fp.edge_lock == "top":
+            ref = model.outline_ymin
+            if poly is not None:
+                lim = polygon_edge_limit(poly, "top", x1 + dx, x2 + dx)
+                if lim is not None:
+                    ref = int(round(lim))
+            dy = ref + EDGE_LOCK_MARGIN - y1
+        else:
+            ref = model.outline_ymax
+            if poly is not None:
+                lim = polygon_edge_limit(poly, "bottom", x1 + dx, x2 + dx)
+                if lim is not None:
+                    ref = int(round(lim))
+            dy = ref - EDGE_LOCK_MARGIN - y2
     if dx or dy:
         for idx in members:
             fp = fps[idx]
