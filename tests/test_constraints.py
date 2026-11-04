@@ -665,5 +665,84 @@ class TestEdgeLockedRotation(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+
+def _violated_soft_model():
+    """Model with one soft group over its span and one part outside its zone."""
+    m = make_model()
+    for i, (x, y) in enumerate([(10, 10), (40, 10), (40, 50)]):
+        m.footprints[i].x = OX + x * MM
+        m.footprints[i].y = OY + y * MM
+    m.footprints[5].x = OX + 60 * MM
+    m.footprints[5].y = OY + 10 * MM
+    apply(m, base_constraints(
+        component_groups=[{"id": "soft", "name": "S", "members": ["R0", "R1", "R2"],
+                           "max_span_mm": 20}],
+        placement_constraints={"zone_preferences": [{"ref": "R5", "zone": "top-left"}]}))
+    return m
+
+
+class TestSoftWeights(unittest.TestCase):
+    """cohesion_weight / zone_weight on CostState and SAConfig (2026-11-04)."""
+
+    def test_zero_weight_disables_both_terms(self):
+        m = _violated_soft_model()
+        ref = CostState(m, quiet=True)
+        self.assertGreater(ref._cohesion_penalty, 0)
+        self.assertGreater(ref._zone_penalty, 0)
+        cs = CostState(m, quiet=True, cohesion_weight=0.0, zone_weight=0.0)
+        self.assertEqual(cs._cohesion_penalty, 0.0)
+        self.assertEqual(cs._zone_penalty, 0.0)
+        self.assertEqual(cs._soft_penalty, 0.0)
+        # incremental path stays at zero too
+        random.seed(2)
+        for _ in range(20):
+            undo = do_translate(m, 1.0, 10 * MM)
+            if undo is not None:
+                cs.incremental_update(affected_indices(undo))
+        self.assertEqual(cs._soft_penalty, 0.0)
+
+    def test_weight_two_doubles_penalty(self):
+        m = _violated_soft_model()
+        one = CostState(m, quiet=True)
+        two = CostState(m, quiet=True, cohesion_weight=2.0, zone_weight=2.0)
+        self.assertAlmostEqual(two._cohesion_penalty, 2 * one._cohesion_penalty, delta=1e-6)
+        self.assertAlmostEqual(two._zone_penalty, 2 * one._zone_penalty, delta=1e-6)
+        self.assertAlmostEqual(two.normalized_cost - one.normalized_cost,
+                               one._soft_penalty, delta=1e-6)
+        # the weights are independent
+        coh_only = CostState(m, quiet=True, zone_weight=0.0)
+        self.assertEqual(coh_only._zone_penalty, 0.0)
+        self.assertAlmostEqual(coh_only._cohesion_penalty, one._cohesion_penalty, delta=1e-6)
+
+    def test_default_weights_are_bit_identical(self):
+        m = _violated_soft_model()
+        self.assertEqual(CostState(m, quiet=True).normalized_cost,
+                         CostState(m, quiet=True, cohesion_weight=1.0,
+                                   zone_weight=1.0).normalized_cost)
+        self.assertEqual(SAConfig().cohesion_weight, 1.0)
+        self.assertEqual(SAConfig().zone_weight, 1.0)
+        self.assertIsNone(SAConfig().seed)
+
+
+class TestSeed(unittest.TestCase):
+    def _run(self, seed):
+        m = _violated_soft_model()
+        random.seed(12345)   # global state must not matter when seed is set
+        res = run_sa(m, config=SAConfig(max_iterations=5, reheat_count=0, num_starts=2,
+                                        scatter_first_start=True, seed=seed,
+                                        cohesion_weight=3.0))
+        return res.best_cost, [(f.x, f.y, f.angle_deg) for f in m.footprints]
+
+    def test_same_seed_reproduces(self):
+        c1, p1 = self._run(5)
+        c2, p2 = self._run(5)
+        self.assertEqual(c1, c2)
+        self.assertEqual(p1, p2)
+
+    def test_different_seeds_differ(self):
+        _, p1 = self._run(5)
+        _, p2 = self._run(6)
+        self.assertNotEqual(p1, p2)
+
 if __name__ == "__main__":
     unittest.main()

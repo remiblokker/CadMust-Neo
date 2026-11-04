@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import List, Callable, Optional, Tuple, Set
 
 from .board_model import BoardModel
-from .cost_function import CostState
+from .cost_function import CostState, COHESION_WEIGHT, ZONE_WEIGHT
 from .moves import (
     select_move_type, do_translate, do_median, do_swap, do_rotate,
     revert_move, affected_indices, MoveUndo, _get_group_members,
@@ -44,6 +44,15 @@ class SAConfig:
 
     congestion_weight: float = 0.0   # 0 = disabled; ~2.0 for moderate congestion avoidance
     congestion_bin_size: int = 5_000_000  # routing bin size in nm (5mm default)
+
+    # Soft constraint-file terms (group cohesion, zone preference); 0 disables
+    cohesion_weight: float = COHESION_WEIGHT
+    zone_weight: float = ZONE_WEIGHT
+
+    # RNG seed: when set, random.seed(seed) is called once at the start of
+    # run_sa, so one seed reproduces one whole multi-start run (calibration,
+    # scatter, moves). The plugin GUI leaves it None (unseeded, as before).
+    seed: Optional[int] = None
 
     callback_interval: float = 0.33  # seconds between UI updates (~3/sec)
 
@@ -548,6 +557,8 @@ def run_sa(
     """
     if config is None:
         config = SAConfig()
+    if config.seed is not None:
+        random.seed(config.seed)
 
     n_moveable = len(model.moveable_indices)
     if config.moves_per_temp == 0:
@@ -568,7 +579,9 @@ def run_sa(
     # Evaluate initial placement cost (start 0 uses this as starting point)
     cost_state = CostState(model,
                            congestion_weight=config.congestion_weight,
-                           congestion_bin_size=config.congestion_bin_size)
+                           congestion_bin_size=config.congestion_bin_size,
+                           cohesion_weight=config.cohesion_weight,
+                           zone_weight=config.zone_weight)
     initial_cost = cost_state.total_cost
 
     # Global best across all starts — initialised to +inf so the first start
@@ -602,7 +615,9 @@ def run_sa(
         # Fresh cost state for this start
         cost_state = CostState(model,
                                congestion_weight=config.congestion_weight,
-                               congestion_bin_size=config.congestion_bin_size)
+                               congestion_bin_size=config.congestion_bin_size,
+                               cohesion_weight=config.cohesion_weight,
+                               zone_weight=config.zone_weight)
 
         # Calibrate T0 for this starting placement
         t0 = auto_calibrate_t0(model, cost_state, config)

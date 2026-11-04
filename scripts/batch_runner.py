@@ -11,6 +11,9 @@ Run with regular python3 (no KiCad needed — uses pickled BoardModel objects):
     python3 scripts/batch_runner.py --model board.pkl --profile quick \
         --constraints board.json --scatter-start \
         --save-model out.pkl --result-json out.json      # one pickle, constraints
+    python3 scripts/batch_runner.py --model board.pkl --profile thorough \
+        --constraints board.json --seed 1 --cohesion-weight 10 --zone-weight 3
+                                                         # weight sweep point
 
 Prerequisite: run extract_models.py first (with KiCad Python) to produce the
 pickled models in <corpus>/models/.
@@ -194,12 +197,27 @@ CSV_FIELDS = [
     "overlaps_before", "overlaps_after",
     "time_s", "temperature_steps", "total_moves", "accepted_moves",
     "accepted_pct",
+    "seed", "cohesion_weight", "zone_weight",
 ]
 
 
 # ---------------------------------------------------------------------------
 # Single-model mode (--model)
 # ---------------------------------------------------------------------------
+
+def apply_overrides(config: SAConfig, args) -> SAConfig:
+    """Apply --scatter-start, --seed, --cohesion-weight, --zone-weight on top
+    of a profile's SAConfig (the flags win over the profile values)."""
+    if args.scatter_start:
+        config.scatter_first_start = True
+    if args.seed is not None:
+        config.seed = args.seed
+    if args.cohesion_weight is not None:
+        config.cohesion_weight = args.cohesion_weight
+    if args.zone_weight is not None:
+        config.zone_weight = args.zone_weight
+    return config
+
 
 def run_single_model(args, cset) -> int:
     """Run one pickle with --board semantics (edge-connector lock, one result
@@ -215,9 +233,7 @@ def run_single_model(args, cset) -> int:
         print(f"  FAILED  {pkl_path} (load): {e}")
         return 1
     profile_name = args.profile
-    config = copy.copy(PROFILES[profile_name])
-    if args.scatter_start:
-        config.scatter_first_start = True
+    config = apply_overrides(copy.copy(PROFILES[profile_name]), args)
     board_name = pkl_path.stem + ".kicad_pcb"
 
     n_unlocked = 0
@@ -266,6 +282,9 @@ def run_single_model(args, cset) -> int:
         "total_moves": result.total_moves,
         "accepted_moves": result.accepted_moves,
         "accepted_pct": round(accepted_pct, 1),
+        "seed": config.seed,
+        "cohesion_weight": config.cohesion_weight,
+        "zone_weight": config.zone_weight,
     }
     if args.out:
         out = Path(args.out)
@@ -334,6 +353,13 @@ def main():
                         help="With --model: pickle the optimised BoardModel to this path")
     parser.add_argument("--result-json", default=None,
                         help="With --model: write a one-object JSON result to this path")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed the RNG once at the start of each SA run "
+                             "(reproduces the whole multi-start run)")
+    parser.add_argument("--cohesion-weight", type=float, default=None,
+                        help="Weight of the soft group-cohesion term (default 1.0, 0 disables)")
+    parser.add_argument("--zone-weight", type=float, default=None,
+                        help="Weight of the soft zone-preference term (default 1.0, 0 disables)")
     args = parser.parse_args()
 
     cset = None
@@ -366,9 +392,7 @@ def main():
     profiles_to_run = list(PROFILES.keys()) if args.profile == "all" else [args.profile]
 
     for profile_name in profiles_to_run:
-        config = copy.copy(PROFILES[profile_name])
-        if args.scatter_start:
-            config.scatter_first_start = True
+        config = apply_overrides(copy.copy(PROFILES[profile_name]), args)
 
         # Output CSV — fixed name per profile (no timestamp) so runs are resumable
         if args.out and len(profiles_to_run) == 1:
@@ -486,6 +510,9 @@ def main():
                 "total_moves": result.total_moves,
                 "accepted_moves": result.accepted_moves,
                 "accepted_pct": round(accepted_pct, 1),
+                "seed": config.seed,
+                "cohesion_weight": config.cohesion_weight,
+                "zone_weight": config.zone_weight,
             }
             writer.writerow(row)
             csv_file.flush()

@@ -41,6 +41,8 @@ POLYGON_BOUNDARY_WEIGHT = 500.0  # polygon cutout violations (nm); 10× BOUNDARY
 KEEPOUT_WEIGHT = 100.0      # per-violation, multiplied by overlap distance (nm)
 COHESION_WEIGHT = 1.0       # per soft group, times excess span (nm): 1 mm excess = 1 mm wire
 ZONE_WEIGHT = 1.0           # per footprint, times distance to preferred zone (nm)
+# Both are defaults only; CostState(cohesion_weight=, zone_weight=) and the
+# SAConfig fields of the same name override them per run (0 disables the term).
 
 # Default congestion bin capacity: assumes 2-layer board, 0.4mm track pitch,
 # both horizontal and vertical routing.  capacity = (bin_size / pitch) * layers * 2.
@@ -239,7 +241,9 @@ class CostState:
 
     def __init__(self, model: BoardModel, quiet: bool = False,
                  congestion_weight: float = 0.0,
-                 congestion_bin_size: int = 5_000_000):
+                 congestion_bin_size: int = 5_000_000,
+                 cohesion_weight: float = COHESION_WEIGHT,
+                 zone_weight: float = ZONE_WEIGHT):
         self.model = model
         self.net_hpwl: Dict[int, int] = {}
         self._total_hpwl: int = 0
@@ -253,6 +257,9 @@ class CostState:
         self._soft_penalty: float = 0.0     # cohesion + zone (one load in total_cost)
         self._congestion_weight: float = congestion_weight
         self._congestion_bin_size: int = congestion_bin_size
+        # Soft-term weights (constraint file). 0 disables the term entirely.
+        self._cohesion_weight: float = cohesion_weight
+        self._zone_weight: float = zone_weight
         self.penalty_scale: float = 1.0  # scales boundary+keepout+congestion (not overlap)
 
         # Caches for incremental updates
@@ -648,7 +655,7 @@ class CostState:
     # --- Soft group cohesion and zone preference (constraint file) ---
 
     def _compute_group_cohesion(self, gi: int) -> float:
-        """max(0, union-bbox diagonal - max_span) * COHESION_WEIGHT for one group."""
+        """max(0, union-bbox diagonal - max_span) * cohesion weight for one group."""
         idx, span = self._soft_groups[gi]
         bx1 = self._bx1; by1 = self._by1; bx2 = self._bx2; by2 = self._by2
         i0 = idx[0]
@@ -659,12 +666,12 @@ class CostState:
             if bx2[k] > x2: x2 = bx2[k]
             if by2[k] > y2: y2 = by2[k]
         excess = math.hypot(x2 - x1, y2 - y1) - span
-        return excess * COHESION_WEIGHT if excess > 0 else 0.0
+        return excess * self._cohesion_weight if excess > 0 else 0.0
 
     def _compute_fp_zone(self, fi: int) -> float:
-        """Distance from the footprint position to its preferred zone rect."""
+        """Distance from the footprint position to its preferred zone rect, times the zone weight."""
         r = self._zone_rects.get(fi)
-        if r is None:
+        if r is None or self._zone_weight == 0:
             return 0.0
         fp = self.model.footprints[fi]
         x = fp.x
@@ -673,7 +680,7 @@ class CostState:
         dy = max(r[1] - y, 0, y - r[3])
         if dx == 0 and dy == 0:
             return 0.0
-        return math.hypot(dx, dy) * ZONE_WEIGHT
+        return math.hypot(dx, dy) * self._zone_weight
 
     def _compute_extra_all(self) -> None:
         """Full recompute of the cohesion and zone terms (bbox arrays must be current)."""
