@@ -51,12 +51,13 @@ Antenna keep-out (schema v2 ``keep_out_zones[].antenna``), resolved by
 resolve_antenna() / antenna_keepout_rect() in the footprint's local frame at 0
 degrees, from pad CENTRES (the model stores no pad sizes):
 
-* side: "pad_free" or "+x" / "-x" / "+y" / "-y". A side's pad row is the set
-  of pads within PAD_ROW_TOL of the outermost pad centre on that side; pads
-  that also sit in a perpendicular side's row are corner pads and do not
-  count. "pad_free" = the one side whose row is empty after that; zero or
-  several such sides is an AntennaError. Explicit sides are in the model's
-  local frame, which for a back-side part is the mirrored (as-placed) frame.
+* side: "pad_free" or "+x" / "-x" / "+y" / "-y". Every pad belongs to the
+  local side it is nearest to, in coordinates normalised to the pad-centre
+  extent (pad_sides; a corner pad goes to its longer row, inner pads to no
+  side); "pad_free" =
+  the one side no pad belongs to, zero or several such sides is an
+  AntennaError. Explicit sides are in the model's local frame, which for a
+  back-side part is the mirrored (as-placed) frame.
 * pad_edge = outermost pad centre on the side; antenna end = pad_edge +
   module_end_beyond_pads_mm (datasheet), or the courtyard bbox edge when the
   item does not give it; antenna strip = [end - depth_mm, end] across the
@@ -308,7 +309,9 @@ def load_constraints(path) -> ConstraintSet:
 # ---------------------------------------------------------------------------
 
 ANTENNA_SIDES = ("+x", "-x", "+y", "-y")
-PAD_ROW_TOL = 500_000   # nm: pad centres this close to the outermost one form a row
+PAD_SIDE_TIE = 0.02     # normalised units: |u| and |v| this close = corner pad
+PAD_SIDE_BAND = 0.4     # pads with max(|u|, |v|) below this are inner pads
+PAD_ROW_TOL = 500_000   # nm: pad centres this close to an extreme form that side's row
 COURTYARD_REPEAT_TOL = 500_000  # nm: a drawing this close to the bbox edge repeats the courtyard
 
 
@@ -346,30 +349,63 @@ def pad_centre_extent(fp) -> Optional[Tuple[int, int, int, int]]:
     return (min(xs), min(ys), max(xs), max(ys))
 
 
-def pad_rows(fp, tol: int = PAD_ROW_TOL) -> Dict[str, List[int]]:
-    """Per local side, indices of the pads in that side's row, corner pads
-    (also in a perpendicular row) removed."""
+def pad_sides(fp) -> Dict[str, int]:
+    """Pad count per local side ("+x", "-x", "+y", "-y"), placement-blind.
+
+    Each pad centre is normalised to the pad-centre extent (u = (dx - cx) /
+    half-width, v = (dy - cy) / half-height, an axis with zero extent reads
+    0) and belongs to the side it is uniquely nearest to: +/-x when |u| > |v|
+    + PAD_SIDE_TIE, +/-y when |v| > |u| + PAD_SIDE_TIE. A corner pad (|u| and
+    |v| within the tie) belongs to whichever of its two sides has the longer
+    pad row (pads within PAD_ROW_TOL of that side's outermost centre), to
+    both when the rows are equal; inner pads (max(|u|, |v|) <
+    PAD_SIDE_BAND, e.g. a thermal pad) belong to no side. Normalising to the pad extent, not the
+    courtyard, keeps the answer independent of how far the courtyard is drawn
+    (a courtyard that already carries the antenna clearance)."""
+    out = {s: 0 for s in ANTENNA_SIDES}
     ext = pad_centre_extent(fp)
     if ext is None:
-        return {s: [] for s in ANTENNA_SIDES}
-    raw = {}
-    for side in ANTENNA_SIDES:
-        axis, sign = _axis_sign(side)
-        edge = ext[2 + axis] if sign > 0 else ext[axis]
-        raw[side] = set(i for i, p in enumerate(fp.pads)
-                        if abs((p.offset_x, p.offset_y)[axis] - edge) <= tol)
-    out = {}
-    for side in ANTENNA_SIDES:
-        perp = [s for s in ANTENNA_SIDES if s[1] != side[1]]
-        corner = raw[perp[0]] | raw[perp[1]]
-        out[side] = sorted(raw[side] - corner)
+        return out
+    cx = (ext[0] + ext[2]) / 2.0
+    cy = (ext[1] + ext[3]) / 2.0
+    hw = (ext[2] - ext[0]) / 2.0
+    hh = (ext[3] - ext[1]) / 2.0
+    edge = {"+x": ext[2], "-x": ext[0], "+y": ext[3], "-y": ext[1]}
+
+    def row_len(side):
+        axis = 0 if side[1] == "x" else 1
+        return sum(1 for q in fp.pads
+                   if abs((q.offset_x, q.offset_y)[axis] - edge[side]) <= PAD_ROW_TOL)
+
+    for p in fp.pads:
+        u = (p.offset_x - cx) / hw if hw > 0 else 0.0
+        v = (p.offset_y - cy) / hh if hh > 0 else 0.0
+        if max(abs(u), abs(v)) < PAD_SIDE_BAND:
+            continue
+        sx = "+x" if u > 0 else "-x"
+        sy = "+y" if v > 0 else "-y"
+        if abs(u) - abs(v) > PAD_SIDE_TIE:
+            out[sx] += 1
+        elif abs(v) - abs(u) > PAD_SIDE_TIE:
+            out[sy] += 1
+        else:
+            # corner pad: it belongs to the side with the longer pad row
+            # (a module's pin 1 to its long pin column, a SOT-23 outer pin
+            # to its two-pin row); equal rows give it to both (conservative:
+            # it can only remove a pad-free side, never invent one)
+            lx, ly = row_len(sx), row_len(sy)
+            if lx >= ly:
+                out[sx] += 1
+            if ly >= lx:
+                out[sy] += 1
     return out
 
 
 def pad_free_sides(fp) -> List[str]:
-    """Local sides (of "+x", "-x", "+y", "-y") with no pad row."""
-    rows = pad_rows(fp)
-    return [s for s in ANTENNA_SIDES if not rows[s]]
+    """Local sides (of "+x", "-x", "+y", "-y") that no pad belongs to
+    (pad_sides). All four for a footprint without pads."""
+    counts = pad_sides(fp)
+    return [s for s in ANTENNA_SIDES if not counts[s]]
 
 
 def resolve_antenna_side(fp, side: str) -> str:

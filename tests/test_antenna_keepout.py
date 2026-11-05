@@ -66,6 +66,27 @@ class TestSideResolution(unittest.TestCase):
         with self.assertRaises(AntennaError):
             antenna_keepout_rect(f, "pad_free", 5 * MM)
 
+    def test_small_parts(self):
+        def part(pads):
+            return Footprint(reference="Q", index=0, x=0, y=0, angle_deg=0.0,
+                             width=3 * MM, height=3 * MM, locked=False,
+                             pads=[Pad(0, "", int(px * MM), int(py * MM)) for px, py in pads])
+        # resistor: pads on +-x
+        self.assertEqual(pad_free_sides(part([(-0.5, 0), (0.5, 0)])), ["+y", "-y"])
+        # SOT-23: two pads on +y, one on -y; the outer pins are corners that
+        # belong to the two-pin row
+        self.assertEqual(pad_free_sides(part([(-0.95, 1), (0.95, 1), (0, -1)])),
+                         ["+x", "-x"])
+        # square corner pads with equal rows go to both sides: none free
+        self.assertEqual(pad_free_sides(part([(-1, -1), (1, -1), (1, 1), (-1, 1)])), [])
+
+    def test_courtyard_size_does_not_change_the_side(self):
+        f = module_fp()
+        f.height = int(41.5 * MM)
+        f.width = int(48.5 * MM)
+        f.cy_offset = int(-7.25 * MM)
+        self.assertEqual(pad_free_sides(f), ["-y"])
+
     def test_no_pads_is_an_error(self):
         f = Footprint(reference="X", index=0, x=0, y=0, angle_deg=0.0,
                       width=MM, height=MM, locked=False)
