@@ -21,7 +21,10 @@ when the model carries no constraints):
   * zone preference: distance from the footprint position to its preferred
     zone rectangle;
   * component clearance (Footprint.clearance): bbox inflated in the overlap test,
-    against bodies on both sides unless restricted to one side.
+    against bodies on both sides unless restricted to one side;
+  * attached keep-out rects (Footprint.keepout_rects, e.g. an antenna area):
+    world rects that collide with other bodies like a clearance ring (same
+    side rule, same-group pairs exempt); not in the boundary term or HPWL.
 """
 from __future__ import annotations
 
@@ -411,6 +414,12 @@ class CostState:
         self._bx2 = [0] * n
         self._by2 = [0] * n
         self._xmin_items: List[Tuple[int, int]] = []  # sorted (xmin, fp_index)
+        # Attached keep-out rects: fps that carry them and their world rects
+        # (refreshed with the bbox arrays). Empty for boards without them.
+        self._ko_fps: List[int] = [
+            i for i, fp in enumerate(model.footprints)
+            if getattr(fp, 'keepout_rects', None)]
+        self._ko_world: Dict[int, List[Tuple[int, int, int, int]]] = {}
         self._rebuild_bbox_arrays()
 
         # Sub-timers for profiling incremental_update breakdown
@@ -472,9 +481,12 @@ class CostState:
         ]
         self._max_clear: int = max(self._fp_clear) if self._fp_clear else 0
         self._clear_fps: List[int] = [i for i, c in enumerate(self._fp_clear) if c > 0]
-        if self._max_clear > 0:
+        # Fps whose overlap reach exceeds their bbox (ring or attached rects);
+        # the neighbour scan tests them explicitly.
+        self._ext_fps: List[int] = sorted(set(self._clear_fps) | set(self._ko_fps))
+        if self._ext_fps:
             # Shadow the plain pair test with the clearance-aware one; boards
-            # without clearances keep the original method untouched.
+            # without clearances or attached rects keep the original method.
             self._compute_pair_overlap = self._compute_pair_overlap_clear
 
         # Cached board extents — avoid self.model.X attribute chain in hot path.
@@ -532,6 +544,8 @@ class CostState:
             self._by2[i] = y2
         self._xmin_items = sorted((self._bx1[i], i)
                                   for i in range(len(self.model.footprints)))
+        for i in self._ko_fps:
+            self._ko_world[i] = self.model.footprints[i].keepout_bboxes
 
     def _update_bbox(self, fi: int) -> None:
         """Update bbox arrays and sorted xmin list for a single footprint."""
@@ -548,6 +562,21 @@ class CostState:
         self._by2[fi] = y2
         # Insert new xmin entry
         bisect.insort(self._xmin_items, (x1, fi))
+        if fi in self._ko_world:
+            self._ko_world[fi] = self.model.footprints[fi].keepout_bboxes
+
+    def _reach(self, fi: int) -> Tuple[int, int, int, int]:
+        """Overlap reach of one fp: its bbox inflated by its clearance ring,
+        united with its attached keep-out rects (world space)."""
+        c = self._fp_clear[fi]
+        x1 = self._bx1[fi] - c; y1 = self._by1[fi] - c
+        x2 = self._bx2[fi] + c; y2 = self._by2[fi] + c
+        for r in self._ko_world.get(fi, ()):
+            if r[0] < x1: x1 = r[0]
+            if r[1] < y1: y1 = r[1]
+            if r[2] > x2: x2 = r[2]
+            if r[3] > y2: y2 = r[3]
+        return x1, y1, x2, y2
 
     def _compute_net_hpwl(self, net: Net) -> int:
         if net.is_excluded or len(net.pad_refs) < 2:
@@ -662,7 +691,8 @@ class CostState:
         return (r[0] - c, r[1] - c, r[2] + c, r[3] + c)
 
     def _compute_pair_overlap_clear(self, i: int, j: int) -> float:
-        """Pair overlap with component clearances (keep-out rings).
+        """Pair overlap with component clearances (keep-out rings) and
+        attached keep-out rects (Footprint.keepout_rects).
 
         A footprint's ring applies to a pair when its side restriction is
         None (both sides) or equals the OTHER footprint's side, as in the
@@ -671,20 +701,26 @@ class CostState:
         the board (a both-sides antenna keep-out also excludes back-side
         bodies). The larger of the ring overlaps and the plain pair overlap
         (same-side body or opposite-side through-hole interaction) counts.
-        Same-group pairs stay exempt.
+        Attached rects follow the same side rule and are tested in world
+        space against the other's raw bbox; the largest single intrusion
+        (ring or rect, ox + oy) counts. Same-group pairs stay exempt.
         """
         ci = self._fp_clear[i]
         cj = self._fp_clear[j]
-        if ci:
+        ki = self._ko_world.get(i)
+        kj = self._ko_world.get(j)
+        if ci or ki:
             si = self._fp_clear_side[i]
             if si is not None and si != self._fp_is_front[j]:
                 ci = 0
-        if cj:
+                ki = None
+        if cj or kj:
             sj = self._fp_clear_side[j]
             if sj is not None and sj != self._fp_is_front[i]:
                 cj = 0
+                kj = None
         plain = CostState._compute_pair_overlap(self, i, j)
-        if not ci and not cj:
+        if not ci and not cj and not ki and not kj:
             return plain
         if self._same_group(i, j):
             return 0.0
@@ -697,6 +733,13 @@ class CostState:
             v = ro(self._inflate(bi, ci), bj)
         if cj:
             v = max(v, ro(bi, self._inflate(bj, cj)))
+        # Attached keep-out rects: each against the other's body bbox
+        if ki:
+            for r in ki:
+                v = max(v, ro(r, bj))
+        if kj:
+            for r in kj:
+                v = max(v, ro(bi, r))
         ring = v * OVERLAP_WEIGHT
         return ring if ring > plain else plain
 
@@ -1142,6 +1185,8 @@ class CostState:
             self._by2[fi] = bbox[3]
             # Insort restored xmin
             bisect.insort(self._xmin_items, (bbox[0], fi))
+            if fi in self._ko_world:
+                self._ko_world[fi] = self.model.footprints[fi].keepout_bboxes
 
     def incremental_update(self, moved_fp_indices: Set[int]) -> float:
         """
@@ -1215,21 +1260,20 @@ class CostState:
         # Clearance rings: a moved fp's own ring widens its window; the few
         # fps that carry a ring are tested explicitly below (cheaper than
         # widening every scan by the largest ring).
-        has_clear = self._max_clear
-        fp_clear = self._fp_clear
+        # Attached keep-out rects: the scan window of a moved fp is the union
+        # of its (ring-inflated) bbox and its rects; the fps with a ring or
+        # rects are tested explicitly with their own reach.
+        ext_fps = self._ext_fps
         for mi in moved_fp_indices:
             mi_x1 = bx1[mi]; mi_y1 = by1[mi]
             mi_x2 = bx2[mi]; mi_y2 = by2[mi]
-            if has_clear:
-                c = fp_clear[mi]
-                if c:
-                    mi_x1 -= c; mi_y1 -= c
-                    mi_x2 += c; mi_y2 += c
-                for j in self._clear_fps:
+            if ext_fps:
+                mi_x1, mi_y1, mi_x2, mi_y2 = self._reach(mi)
+                for j in ext_fps:
                     if j != mi and j not in moved_fp_indices:
-                        cj = fp_clear[j] + fp_clear[mi]
-                        if (bx1[j] - cj < bx2[mi] and bx2[j] + cj > bx1[mi]
-                                and by1[j] - cj < by2[mi] and by2[j] + cj > by1[mi]):
+                        jx1, jy1, jx2, jy2 = self._reach(j)
+                        if (jx1 < mi_x2 and jx2 > mi_x1
+                                and jy1 < mi_y2 and jy2 > mi_y1):
                             pairs_to_update.add(_pair_key(mi, j))
             # All fps with xmin < mi_x2 are candidates (left edge left of query right edge)
             i1 = bisect.bisect_left(xmin_items, (mi_x2, -1))

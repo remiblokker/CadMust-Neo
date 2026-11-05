@@ -40,9 +40,35 @@ Mapping onto the engine:
     keep_out_zones       Footprint.clearance / clearance_side (overlap inflation);
                          empty layers or both F.Cu and B.Cu = ring on both
                          sides (opposite-side bodies count too), a single
-                         copper layer = that side only
+                         copper layer = that side only. An item with an
+                         "antenna" object is no ring: it attaches one local
+                         rect (Footprint.keepout_rects, antenna_keepout_rect)
+                         beyond the antenna end of the module; same layer rule
     meta                 board size sanity check (warning only)
     signal_classes, design_notes, req_ids, source: ignored by the engine
+
+Antenna keep-out (schema v2 ``keep_out_zones[].antenna``), resolved by
+resolve_antenna() / antenna_keepout_rect() in the footprint's local frame at 0
+degrees, from pad CENTRES (the model stores no pad sizes):
+
+* side: "pad_free" or "+x" / "-x" / "+y" / "-y". A side's pad row is the set
+  of pads within PAD_ROW_TOL of the outermost pad centre on that side; pads
+  that also sit in a perpendicular side's row are corner pads and do not
+  count. "pad_free" = the one side whose row is empty after that; zero or
+  several such sides is an AntennaError. Explicit sides are in the model's
+  local frame, which for a back-side part is the mirrored (as-placed) frame.
+* pad_edge = outermost pad centre on the side; antenna end = pad_edge +
+  module_end_beyond_pads_mm (datasheet), or the courtyard bbox edge when the
+  item does not give it; antenna strip = [end - depth_mm, end] across the
+  pad-centre extent (recorded, see below).
+* keep-out rect: outward from the bbox edge to end + clearance_mm, sideways
+  the pad-centre extent widened by clearance_mm on both sides. Clipped to
+  the region beyond the bbox edge (what the courtyard already covers adds
+  nothing; a zero-depth result means the courtyard already encodes it and
+  nothing is attached). The rect starts AT the bbox edge even when the strip
+  begins further out: the module body between the courtyard and the strip
+  is part of the physical module and must stay free too, so depth_mm does
+  not move the rect; it is reported and cross-checked only.
 
 constrained_refs() lists every reference the file places; unlock_refs()
 clears the board lock on those parts (batch_runner --unlock constrained).
@@ -239,6 +265,8 @@ def _validate(data) -> Tuple[List[str], List[str]]:
                             errors.append("%s.clearance_mm must be >= 0" % where)
                         if "layers" in it and not _is_str_list(it["layers"]):
                             errors.append("%s.layers must be an array of strings" % where)
+                        if "antenna" in it:
+                            errors.extend(validate_antenna(it["antenna"], where + ".antenna"))
 
     sc = data.get("signal_classes")
     if sc is not None and not isinstance(sc, list):
@@ -273,6 +301,212 @@ def load_constraints(path) -> ConstraintSet:
     except OSError as e:
         raise ConstraintError("cannot read constraint file %s: %s" % (path, e))
     return parse_constraints(data, path)
+
+
+# ---------------------------------------------------------------------------
+# Antenna keep-out resolution (pure geometry on one Footprint, no position)
+# ---------------------------------------------------------------------------
+
+ANTENNA_SIDES = ("+x", "-x", "+y", "-y")
+PAD_ROW_TOL = 500_000   # nm: pad centres this close to the outermost one form a row
+COURTYARD_REPEAT_TOL = 500_000  # nm: a drawing this close to the bbox edge repeats the courtyard
+
+
+class AntennaError(ValueError):
+    """The antenna side cannot be resolved for this footprint."""
+
+
+def validate_antenna(a, where: str = "antenna") -> List[str]:
+    """Structural errors of a keep_out_zones[].antenna object."""
+    if not isinstance(a, dict):
+        return ["%s must be an object" % where]
+    errors = []
+    side = a.get("side")
+    if side not in ("pad_free",) + ANTENNA_SIDES:
+        errors.append("%s.side must be one of %s" % (where, ["pad_free"] + list(ANTENNA_SIDES)))
+    for k in ("module_end_beyond_pads_mm", "depth_mm"):
+        if k in a and not (_is_num(a[k]) and a[k] >= 0):
+            errors.append("%s.%s must be a number >= 0" % (where, k))
+    for k in a:
+        if k not in ("side", "module_end_beyond_pads_mm", "depth_mm"):
+            errors.append("%s: unknown key '%s'" % (where, k))
+    return errors
+
+
+def _axis_sign(side: str) -> Tuple[int, int]:
+    return (0 if side[1] == "x" else 1), (1 if side[0] == "+" else -1)
+
+
+def pad_centre_extent(fp) -> Optional[Tuple[int, int, int, int]]:
+    """Local (xmin, ymin, xmax, ymax) of the pad centres, None without pads."""
+    if not fp.pads:
+        return None
+    xs = [p.offset_x for p in fp.pads]
+    ys = [p.offset_y for p in fp.pads]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def pad_rows(fp, tol: int = PAD_ROW_TOL) -> Dict[str, List[int]]:
+    """Per local side, indices of the pads in that side's row, corner pads
+    (also in a perpendicular row) removed."""
+    ext = pad_centre_extent(fp)
+    if ext is None:
+        return {s: [] for s in ANTENNA_SIDES}
+    raw = {}
+    for side in ANTENNA_SIDES:
+        axis, sign = _axis_sign(side)
+        edge = ext[2 + axis] if sign > 0 else ext[axis]
+        raw[side] = set(i for i, p in enumerate(fp.pads)
+                        if abs((p.offset_x, p.offset_y)[axis] - edge) <= tol)
+    out = {}
+    for side in ANTENNA_SIDES:
+        perp = [s for s in ANTENNA_SIDES if s[1] != side[1]]
+        corner = raw[perp[0]] | raw[perp[1]]
+        out[side] = sorted(raw[side] - corner)
+    return out
+
+
+def pad_free_sides(fp) -> List[str]:
+    """Local sides (of "+x", "-x", "+y", "-y") with no pad row."""
+    rows = pad_rows(fp)
+    return [s for s in ANTENNA_SIDES if not rows[s]]
+
+
+def resolve_antenna_side(fp, side: str) -> str:
+    """An explicit side as given; "pad_free" resolved to the one pad-free
+    side. Raises AntennaError when that is not exactly one side."""
+    if side in ANTENNA_SIDES:
+        return side
+    if side != "pad_free":
+        raise AntennaError("unknown antenna side %r" % (side,))
+    if not fp.pads:
+        raise AntennaError("%s has no pads, so no pad-free side" % fp.reference)
+    free = pad_free_sides(fp)
+    if len(free) != 1:
+        raise AntennaError("%s: pad_free is ambiguous, %d pad-free sides (%s)"
+                           % (fp.reference, len(free), ", ".join(free) or "none"))
+    return free[0]
+
+
+def _from_outward(axis: int, sign: int, u0: int, u1: int, p0: int, p1: int):
+    """Local rect from an outward interval [u0, u1] along (axis, sign) and a
+    perpendicular interval [p0, p1]."""
+    a0, a1 = (u0, u1) if sign > 0 else (-u1, -u0)
+    if axis == 0:
+        return (a0, p0, a1, p1)
+    return (p0, a0, p1, a1)
+
+
+@dataclass
+class AntennaResolution:
+    """Everything resolve_antenna derives; nm, local frame at 0 degrees."""
+    side: str                                  # resolved local side
+    rect: Tuple[int, int, int, int]            # keep-out rect (may have zero area)
+    strip: Tuple[int, int, int, int]           # antenna strip (record only)
+    pad_edge: int                              # outward coord of the outermost pad centre
+    bbox_edge: int                             # outward coord of the courtyard bbox edge
+    antenna_end: int                           # outward coord of the module's antenna end
+    module_end_source: str                     # "datasheet" or "courtyard"
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def zero_area(self) -> bool:
+        r = self.rect
+        return r[2] <= r[0] or r[3] <= r[1]
+
+
+def resolve_antenna(fp, side: str, clearance_nm: int,
+                    module_end_beyond_pads_nm: Optional[int] = None,
+                    depth_nm: Optional[int] = None) -> AntennaResolution:
+    """Resolve an antenna keep-out on one footprint (see the module doc).
+    Uses sizes and pad offsets only, never the position."""
+    rs = resolve_antenna_side(fp, side)
+    ext = pad_centre_extent(fp)
+    if ext is None:
+        raise AntennaError("%s has no pads" % fp.reference)
+    axis, sign = _axis_sign(rs)
+    lb = fp.local_bbox
+    pad_edge = sign * (ext[2 + axis] if sign > 0 else ext[axis])
+    bbox_edge = sign * (lb[2 + axis] if sign > 0 else lb[axis])
+    notes = []
+    if module_end_beyond_pads_nm is None:
+        end = bbox_edge
+        source = "courtyard"
+        notes.append("no module_end_beyond_pads_mm: the courtyard bbox edge is taken "
+                     "as the module's antenna end")
+    else:
+        end = pad_edge + int(module_end_beyond_pads_nm)
+        source = "datasheet"
+    depth = int(depth_nm or 0)
+    p0 = ext[1 - axis] - int(clearance_nm)
+    p1 = ext[3 - axis] + int(clearance_nm)
+    strip = _from_outward(axis, sign, end - depth, end, ext[1 - axis], ext[3 - axis])
+    outer = max(bbox_edge, end + int(clearance_nm))
+    rect = _from_outward(axis, sign, bbox_edge, outer, p0, p1)
+    if outer == bbox_edge:
+        notes.append("zero area: the courtyard already covers the antenna end plus "
+                     "the clearance on this side")
+    if source == "datasheet" and end < bbox_edge:
+        notes.append("the antenna end lies %.2f mm inside the courtyard bbox"
+                     % ((bbox_edge - end) / MM))
+    if depth and end - depth < pad_edge:
+        notes.append("depth_mm reaches %.2f mm past the outermost pad centre into the pads"
+                     % ((pad_edge - (end - depth)) / MM))
+    return AntennaResolution(side=rs, rect=rect, strip=strip, pad_edge=pad_edge,
+                             bbox_edge=bbox_edge, antenna_end=end,
+                             module_end_source=source, notes=notes)
+
+
+def antenna_keepout_rect(fp, side: str, clearance_nm: int,
+                         module_end_beyond_pads_nm: Optional[int] = None,
+                         depth_nm: Optional[int] = None) -> Tuple[int, int, int, int]:
+    """The local keep-out rect (nm, 0 degrees, relative to the fp origin) of
+    an antenna keep-out; zero area when the courtyard already encodes it.
+    Raises AntennaError when the side cannot be resolved."""
+    return resolve_antenna(fp, side, clearance_nm, module_end_beyond_pads_nm,
+                           depth_nm).rect
+
+
+def resolve_antenna_item(fp, item: dict) -> AntennaResolution:
+    """resolve_antenna for a keep_out_zones item that has an "antenna" object."""
+    a = item.get("antenna") or {}
+    me = a.get("module_end_beyond_pads_mm")
+    d = a.get("depth_mm")
+    return resolve_antenna(
+        fp, a.get("side", "pad_free"), int(round(float(item.get("clearance_mm", 0)) * MM)),
+        None if me is None else int(round(me * MM)),
+        None if d is None else int(round(d * MM)))
+
+
+def drawing_crosscheck(fp, res: AntennaResolution, tol_nm: int = MM) -> Optional[dict]:
+    """Compare the datasheet antenna end with the drawn outline on that side.
+
+    The drawn end is taken from the drawing layer (Footprint.drawing_rects)
+    that extends furthest beyond the outermost pad centre, ignoring layers
+    whose outline on that side lies within COURTYARD_REPEAT_TOL of the
+    courtyard bbox edge (an outline drawn as large as the courtyard repeats
+    the courtyard, it does not show the module). A drawing beyond the
+    courtyard counts (the Olimex U3 case). Returns None when the model has
+    no per-layer drawings or no layer qualifies, else {layer,
+    drawn_end_beyond_pads_mm, datasheet_end_beyond_pads_mm, difference_mm,
+    ok}."""
+    rects = getattr(fp, "drawing_rects", None) or {}
+    axis, sign = _axis_sign(res.side)
+    best = None
+    for layer, r in sorted(rects.items()):
+        u = sign * (r[2 + axis] if sign > 0 else r[axis])
+        if u <= res.pad_edge or abs(u - res.bbox_edge) <= COURTYARD_REPEAT_TOL:
+            continue
+        if best is None or u > best[1]:
+            best = (layer, u)
+    if best is None:
+        return None
+    diff = best[1] - res.antenna_end
+    return {"layer": best[0],
+            "drawn_end_beyond_pads_mm": round((best[1] - res.pad_edge) / MM, 3),
+            "datasheet_end_beyond_pads_mm": round((res.antenna_end - res.pad_edge) / MM, 3),
+            "difference_mm": round(diff / MM, 3),
+            "ok": abs(diff) <= tol_nm}
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +885,23 @@ def apply_constraints(model: BoardModel, cset: ConstraintSet,
         elif cu == {"B.Cu"}:
             side = False
         f = fps[idx]
+        if "antenna" in it:
+            try:
+                res = resolve_antenna_item(f, it)
+            except AntennaError as e:
+                rep._skip("keep_out_zones", ref, "antenna: %s" % e)
+                continue
+            if res.module_end_source == "courtyard":
+                rep.warnings.append("keep_out_zones %s: antenna end taken at the courtyard "
+                                    "bbox edge (no module_end_beyond_pads_mm)" % ref)
+            if res.zero_area:
+                rep._skip("keep_out_zones", ref, "antenna: courtyard already covers the "
+                          "keep-out (zero-area rect)")
+                continue
+            f.keepout_rects = list(getattr(f, "keepout_rects", ()) or ()) + [res.rect]
+            f.clearance_side = side
+            rep._applied("keep_out_zones")
+            continue
         c = int(round(it["clearance_mm"] * MM))
         if c <= 0:
             rep._skip("keep_out_zones", ref, "clearance is 0")

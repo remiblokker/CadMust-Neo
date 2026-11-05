@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple, Set, Optional, Sequence
 
 
 # Power net detection — net name patterns that are unambiguously power/ground.
@@ -114,6 +114,21 @@ class Footprint:
     edge_lock: Optional[str] = None      # "top"/"bottom"/"left"/"right": slides along that edge
     clearance: int = 0                   # component-centred keep-out ring (nm), 0 = none
     clearance_side: Optional[bool] = None  # None = both sides, True = front only, False = back only
+    # Attached keep-out rects (constraints.antenna_keepout_rect), local coords
+    # at 0 degrees relative to the fp origin, nm, the th_rects convention.
+    # They rotate with the part and count in the overlap test only (not in
+    # the boundary penalty, not in HPWL). The tuple default is a class
+    # attribute, so pickles from before the field read "none".
+    keepout_rects: Sequence[Tuple[int, int, int, int]] = ()
+    # Local bbox at 0 degrees of the footprint's drawn graphics (lines, rects,
+    # polys, circles, arcs on Fab, User and SilkS layers; no text), nm. A
+    # cross-check for the datasheet antenna end, never the keep-out itself.
+    # None = no such graphics, or a model extracted before the field existed.
+    drawing_rect: Optional[Tuple[int, int, int, int]] = None
+    # The same per drawing layer ("F.Fab", "Dwgs.User", "F.SilkS", ...), for
+    # cross-checks (a Fab outline may be drawn as large as the courtyard).
+    # Never defines a keep-out. None = none / old model.
+    drawing_rects: Optional[Dict[str, Tuple[int, int, int, int]]] = None
     # Cached trig values for abs_position (updated via set_angle)
     _cos_a: float = field(init=False, repr=False, default=1.0)
     _sin_a: float = field(init=False, repr=False, default=0.0)
@@ -169,6 +184,36 @@ class Footprint:
                 hw, hh = (x2 - x1) // 2, (y2 - y1) // 2
             out.append((cx - hw, cy - hh, cx + hw, cy + hh))
         return out
+
+    @property
+    def local_bbox(self) -> Tuple[int, int, int, int]:
+        """The bbox in the local frame at 0 degrees, relative to the origin."""
+        hw, hh = self.width // 2, self.height // 2
+        return (self.cx_offset - hw, self.cy_offset - hh,
+                self.cx_offset + hw, self.cy_offset + hh)
+
+    def local_rect_to_world(self, r: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        """World-space axis-aligned bbox of a local rect (rotated like the pads).
+
+        Exact for multiples of 90 degrees; for other angles the bbox of the
+        rotated rect.
+        """
+        c, s = self._cos_a, self._sin_a
+        xs = []
+        ys = []
+        for lx, ly in ((r[0], r[1]), (r[2], r[1]), (r[2], r[3]), (r[0], r[3])):
+            xs.append(lx * c - ly * s)
+            ys.append(lx * s + ly * c)
+        return (self.x + int(round(min(xs))), self.y + int(round(min(ys))),
+                self.x + int(round(max(xs))), self.y + int(round(max(ys))))
+
+    @property
+    def keepout_bboxes(self) -> List[Tuple[int, int, int, int]]:
+        """World-space rects of the attached keep-outs (empty if none)."""
+        rects = getattr(self, 'keepout_rects', ())
+        if not rects:
+            return []
+        return [self.local_rect_to_world(r) for r in rects]
 
 
 @dataclass
@@ -281,6 +326,125 @@ def extract_keepouts(board) -> List[KeepOut]:
                 layers=_rule_area_layers(board, zone),
             ))
     return keepouts
+
+
+# Layers whose graphics describe the physical part outline (drawing_rect).
+_DRAWING_LAYER_NAMES = ("F_Fab", "B_Fab", "Dwgs_User", "Cmts_User",
+                        "F_SilkS", "B_SilkS")
+
+
+def _shape_points_world(item, pcbnew_mod) -> List[Tuple[float, float]]:
+    """Geometric points (world coords, no stroke width) that bound one
+    graphic shape: segment ends, rect corners, circle bbox corners, arc
+    samples, polygon vertices, bezier control points. Text returns []."""
+    try:
+        cls = item.GetClass()
+    except Exception:
+        cls = ""
+    if "TEXT" in str(cls).upper():
+        return []
+    if not hasattr(item, "GetShape"):
+        return []
+    pts: List[Tuple[float, float]] = []
+    shape = item.GetShape()
+
+    def const(name):
+        return getattr(pcbnew_mod, name, object())
+
+    try:
+        if shape == const("SHAPE_T_CIRCLE"):
+            c = item.GetCenter()
+            r = item.GetRadius()
+            pts += [(c.x - r, c.y - r), (c.x + r, c.y + r),
+                    (c.x - r, c.y + r), (c.x + r, c.y - r)]
+        elif shape == const("SHAPE_T_ARC"):
+            c = item.GetCenter()
+            r = float(item.GetRadius())
+            a0 = math.atan2(item.GetStart().y - c.y, item.GetStart().x - c.x)
+            am = math.atan2(item.GetArcMid().y - c.y, item.GetArcMid().x - c.x)
+            a1 = math.atan2(item.GetEnd().y - c.y, item.GetEnd().x - c.x)
+            # sweep from a0 to a1 through am
+            def norm(a):
+                return a % (2 * math.pi)
+            sweep = norm(a1 - a0)
+            if norm(am - a0) > sweep:      # mid lies on the other way round
+                sweep = sweep - 2 * math.pi
+            for k in range(33):
+                a = a0 + sweep * k / 32
+                pts.append((c.x + r * math.cos(a), c.y + r * math.sin(a)))
+        elif shape == const("SHAPE_T_RECTANGLE") or shape == const("SHAPE_T_RECT"):
+            try:
+                pts += [(p.x, p.y) for p in item.GetRectCorners()]
+            except Exception:
+                a, b = item.GetStart(), item.GetEnd()
+                pts += [(a.x, a.y), (b.x, b.y), (a.x, b.y), (b.x, a.y)]
+        elif shape == const("SHAPE_T_POLY"):
+            poly = item.GetPolyShape()
+            for oi in range(poly.OutlineCount()):
+                ol = poly.Outline(oi)
+                for vi in range(ol.PointCount()):
+                    p = ol.CPoint(vi)
+                    pts.append((p.x, p.y))
+        elif shape == const("SHAPE_T_BEZIER"):
+            for getter in ("GetStart", "GetBezierC1", "GetBezierC2", "GetEnd"):
+                p = getattr(item, getter)()
+                pts.append((p.x, p.y))
+        else:  # segment and anything unknown: the two end points
+            a, b = item.GetStart(), item.GetEnd()
+            pts += [(a.x, a.y), (b.x, b.y)]
+    except Exception:
+        return []
+    return pts
+
+
+def extract_drawing_rects(fp, pcbnew_mod) -> Dict[str, Tuple[int, int, int, int]]:
+    """Per-layer local bboxes at 0 degrees (relative to the fp origin, nm) of
+    the footprint's drawn graphics on the Fab, User and SilkS layers, keyed
+    by KiCad layer name ("F.Fab", "Dwgs.User", ...). Layers without shapes
+    are absent.
+
+    World points are un-rotated like the pad offsets, so a footprint on the
+    back side gives its mirrored local outline, consistent with its pads."""
+    layer_ids = {}
+    for name in _DRAWING_LAYER_NAMES:
+        v = getattr(pcbnew_mod, name, None)
+        if v is not None:
+            layer_ids[v] = name.replace("_", ".")
+    pos = fp.GetPosition()
+    angle = fp.GetOrientationDegrees() % 360.0
+    rad = math.radians(angle)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+    out: Dict[str, List[int]] = {}
+    for item in fp.GraphicalItems():
+        try:
+            lname = layer_ids.get(item.GetLayer())
+        except Exception:
+            continue
+        if lname is None:
+            continue
+        for (wx, wy) in _shape_points_world(item, pcbnew_mod):
+            tx = wx - pos.x
+            ty = wy - pos.y
+            lx = int(round(tx * cos_a - ty * sin_a))
+            ly = int(round(tx * sin_a + ty * cos_a))
+            r = out.get(lname)
+            if r is None:
+                out[lname] = [lx, ly, lx, ly]
+            else:
+                r[0] = min(r[0], lx); r[1] = min(r[1], ly)
+                r[2] = max(r[2], lx); r[3] = max(r[3], ly)
+    return {k: (v[0], v[1], v[2], v[3]) for k, v in out.items()
+            if not (v[0] == v[2] and v[1] == v[3])}
+
+
+def union_rect(rects) -> Optional[Tuple[int, int, int, int]]:
+    """Bounding box of a collection of rects, None when empty."""
+    rects = list(rects)
+    if not rects:
+        return None
+    return (min(r[0] for r in rects), min(r[1] for r in rects),
+            max(r[2] for r in rects), max(r[3] for r in rects))
 
 
 def extract_board_model(board, selected_only: bool = False) -> BoardModel:
@@ -465,6 +629,13 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
         # well-separated pads → individual rects)
         fp_th_rects = merge_pad_rects(th_pad_rects)
 
+        try:
+            import pcbnew as _pcbnew
+            fp_drawing_rects = extract_drawing_rects(fp, _pcbnew)
+        except Exception:
+            fp_drawing_rects = {}
+        fp_drawing_rect = union_rect(fp_drawing_rects.values())
+
         is_locked = fp.IsLocked() or (selected_only and not fp.IsSelected())
         try:
             uuid = fp.m_Uuid.AsString()
@@ -490,6 +661,8 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
             uuid_str=uuid,
             is_front=is_front,
             th_rects=fp_th_rects,
+            drawing_rect=fp_drawing_rect,
+            drawing_rects=fp_drawing_rects or None,
         )
         footprints.append(f)
 
