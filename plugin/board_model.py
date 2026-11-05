@@ -447,6 +447,81 @@ def union_rect(rects) -> Optional[Tuple[int, int, int, int]]:
             max(r[2] for r in rects), max(r[3] for r in rects))
 
 
+def _courtyard_points_world(item, pcbnew_mod, pos, cos_a, sin_a
+                            ) -> List[Tuple[float, float]]:
+    """World points that bound one courtyard / fab graphic for the placement
+    bbox. Start/end are only geometry for segments, rects, arcs (plus the arc
+    mid) and beziers. A polygon (fp_poly) returns (0, 0) from GetStart() and
+    GetEnd() in world coordinates, so it contributes its outline vertices
+    only; using start/end there stretched e.g. a U.FL courtyard to the board
+    origin. Circles give the corners of their local (0 degree) bbox mapped
+    back to world, as before."""
+    def const(*names):
+        vals = set()
+        for n in names:
+            v = getattr(pcbnew_mod, n, None)
+            if v is not None:
+                vals.add(v)
+        return vals
+
+    pts: List[Tuple[float, float]] = []
+    try:
+        shape_val = item.GetShape() if hasattr(item, "GetShape") else None
+    except Exception:
+        shape_val = None
+
+    if shape_val is not None and shape_val in const("SHAPE_T_CIRCLE", "S_CIRCLE"):
+        try:
+            c = item.GetCenter()
+            r = item.GetRadius()
+        except AttributeError:
+            return pts
+        tx_c = c.x - pos.x
+        ty_c = c.y - pos.y
+        lcx = tx_c * cos_a - ty_c * sin_a
+        lcy = tx_c * sin_a + ty_c * cos_a
+
+        def local_to_world(lx, ly):
+            return (pos.x + lx * cos_a + ly * sin_a, pos.y - lx * sin_a + ly * cos_a)
+        for (lx, ly) in ((lcx - r, lcy - r), (lcx + r, lcy - r),
+                         (lcx - r, lcy + r), (lcx + r, lcy + r)):
+            pts.append(local_to_world(lx, ly))
+        return pts
+
+    if shape_val is not None and shape_val in const("SHAPE_T_POLY", "S_POLYGON"):
+        try:
+            poly = item.GetPolyShape()
+            for oi in range(poly.OutlineCount()):
+                outline = poly.Outline(oi)
+                for vi in range(outline.PointCount()):
+                    p = outline.CPoint(vi)
+                    pts.append((p.x, p.y))
+        except AttributeError:
+            pass
+        return pts
+
+    # Segment, rect, arc, bezier (and unknown shapes): start and end.
+    try:
+        a, b = item.GetStart(), item.GetEnd()
+        pts += [(a.x, a.y), (b.x, b.y)]
+    except AttributeError:
+        return pts
+    if shape_val is not None and shape_val in const("SHAPE_T_ARC", "S_ARC"):
+        try:
+            m = item.GetArcMid()
+            pts.append((m.x, m.y))
+        except AttributeError:
+            pass
+    elif shape_val is not None and shape_val in const("SHAPE_T_BEZIER", "S_CURVE"):
+        for getter in ("GetBezierC1", "GetBezierC2"):
+            try:
+                p = getattr(item, getter)()
+                pts.append((p.x, p.y))
+            except AttributeError:
+                pass
+    return pts
+
+
 def extract_board_model(board, selected_only: bool = False) -> BoardModel:
     """
     Extract board data from a pcbnew.BOARD into a BoardModel.
@@ -555,45 +630,11 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
                 for item in fp.GraphicalItems():
                     if item.GetLayer() not in layer_set:
                         continue
-                    pts_world = []
-                    try:
-                        is_circle = False
-                        if hasattr(item, 'GetShape'):
-                            shape_val = item.GetShape()
-                            is_circle = shape_val in (getattr(_pcbnew, 'S_CIRCLE', -1), getattr(_pcbnew, 'SHAPE_T_CIRCLE', -1))
-                        if is_circle and hasattr(item, 'GetCenter') and hasattr(item, 'GetRadius'):
-                            c = item.GetCenter()
-                            r = item.GetRadius()
-                            class Pt:
-                                def __init__(self, x, y):
-                                    self.x = x
-                                    self.y = y
-                            tx_c = c.x - pos.x
-                            ty_c = c.y - pos.y
-                            lcx = tx_c * cos_a - ty_c * sin_a
-                            lcy = tx_c * sin_a + ty_c * cos_a
-                            def local_to_world(lx, ly):
-                                return Pt(pos.x + lx * cos_a + ly * sin_a, pos.y - lx * sin_a + ly * cos_a)
-                            pts_world.append(local_to_world(lcx - r, lcy - r))
-                            pts_world.append(local_to_world(lcx + r, lcy - r))
-                            pts_world.append(local_to_world(lcx - r, lcy + r))
-                            pts_world.append(local_to_world(lcx + r, lcy + r))
-                        else:
-                            pts_world.append(item.GetStart())
-                            pts_world.append(item.GetEnd())
-                    except AttributeError:
-                        pass
-                    try:
-                        shape = item.GetPolyShape()
-                        if shape.OutlineCount() > 0:
-                            outline = shape.Outline(0)
-                            for vi in range(outline.PointCount()):
-                                pts_world.append(outline.CPoint(vi))
-                    except AttributeError:
-                        pass
-                    for pt in pts_world:
-                        tx = pt.x - pos.x
-                        ty = pt.y - pos.y
+                    pts_world = _courtyard_points_world(
+                        item, _pcbnew, pos, cos_a, sin_a)
+                    for (px, py) in pts_world:
+                        tx = px - pos.x
+                        ty = py - pos.y
                         lx = int(tx * cos_a - ty * sin_a)
                         ly = int(tx * sin_a + ty * cos_a)
                         if ext_xmin is None:
