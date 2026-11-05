@@ -43,6 +43,9 @@ Mapping onto the engine:
                          copper layer = that side only
     meta                 board size sanity check (warning only)
     signal_classes, design_notes, req_ids, source: ignored by the engine
+
+constrained_refs() lists every reference the file places; unlock_refs()
+clears the board lock on those parts (batch_runner --unlock constrained).
 """
 from __future__ import annotations
 
@@ -270,6 +273,82 @@ def load_constraints(path) -> ConstraintSet:
     except OSError as e:
         raise ConstraintError("cannot read constraint file %s: %s" % (path, e))
     return parse_constraints(data, path)
+
+
+# ---------------------------------------------------------------------------
+# Constrained references and selective unlock
+# ---------------------------------------------------------------------------
+
+def constrained_refs(constraints) -> set:
+    """References the constraint file places: members of component_groups
+    (including template anchors and template members) and every per-ref entry
+    of placement_constraints (edge_locked, zone_preferences, keep_out_zones,
+    fixed_positions, back_side). Accepts a ConstraintSet or the decoded dict.
+
+    Used by `batch_runner.py --unlock constrained` (and reusable by the plugin
+    GUI): a board lock on a part the file places is older information than
+    the file, so these parts lose their board lock."""
+    data = constraints.data if isinstance(constraints, ConstraintSet) else (constraints or {})
+    refs = set()
+    for g in data.get("component_groups") or []:
+        if not isinstance(g, dict):
+            continue
+        refs.update(r for r in (g.get("members") or []) if isinstance(r, str))
+        t = g.get("template")
+        if isinstance(t, dict):
+            if isinstance(t.get("anchor"), str):
+                refs.add(t["anchor"])
+            rp = t.get("relative_positions")
+            if isinstance(rp, dict):
+                refs.update(r for r in rp if isinstance(r, str))
+    pc = data.get("placement_constraints") or {}
+    if isinstance(pc, dict):
+        for key in _PLACEMENT_KEYS:
+            for it in pc.get(key) or []:
+                if isinstance(it, dict) and isinstance(it.get("ref"), str):
+                    refs.add(it["ref"])
+    return refs
+
+
+def unlock_refs(model: BoardModel, refs) -> List[str]:
+    """Clear the locked flag on the footprints named in `refs` (first
+    occurrence of a reference, as in apply_constraints) and on the KiCad
+    groups that contain them. A rigid group moves as one body and stays
+    locked while any member is locked, so every member of such a group is
+    unlocked too. moveable_indices is rebuilt: unlocked footprints (one
+    representative, the first member, per unlocked group) become moveable,
+    nothing else changes. Returns the references whose lock flag was cleared,
+    sorted; footprints that were not locked are not listed."""
+    fps = model.footprints
+    by_ref: Dict[str, int] = {}
+    for i, f in enumerate(fps):
+        by_ref.setdefault(f.reference, i)
+    targets = set(by_ref[r] for r in refs if r in by_ref)
+    groups = set()
+    for idx in list(targets):
+        gi = model.fp_to_group.get(idx)
+        if gi is not None:
+            groups.add(gi)
+            targets.update(model.component_groups[gi].member_indices)
+    cleared = []
+    for idx in sorted(targets):
+        if fps[idx].locked:
+            fps[idx].locked = False
+            cleared.append(fps[idx].reference)
+    for gi in groups:
+        model.component_groups[gi].locked = False
+    candidates = set(model.moveable_indices) | targets
+    excluded = set()
+    for grp in model.component_groups:
+        if grp.locked or any(fps[i].locked for i in grp.member_indices):
+            excluded.update(grp.member_indices)
+        else:
+            excluded.update(grp.member_indices[1:])
+            if targets.intersection(grp.member_indices):
+                candidates.add(grp.member_indices[0])
+    model.moveable_indices = [i for i, f in enumerate(fps)
+                              if i in candidates and not f.locked and i not in excluded]
+    return sorted(cleared)
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from plugin.board_model import BoardModel, Footprint, Pad, Net
 from plugin.cost_function import CostState, OVERLAP_WEIGHT
-from plugin.constraints import (anchor_frame_offset,
+from plugin.board_model import ComponentGroup
+from plugin.constraints import (anchor_frame_offset, constrained_refs, unlock_refs,
                                 load_constraints, parse_constraints,
                                 apply_constraints, ConstraintError, zone_rect_nm)
 from plugin.moves import (do_translate, do_median, do_swap, do_rotate,
@@ -743,6 +744,183 @@ class TestSeed(unittest.TestCase):
         _, p1 = self._run(5)
         _, p2 = self._run(6)
         self.assertNotEqual(p1, p2)
+
+
+# ---------------------------------------------------------------------------
+# --unlock constrained (constrained_refs, unlock_refs, batch_runner)
+# ---------------------------------------------------------------------------
+
+def _full_constraints():
+    return base_constraints(
+        component_groups=[
+            {"id": "g", "members": ["R1", "R2"], "max_span_mm": 20},
+            {"id": "t", "members": ["R3"],
+             "template": {"anchor": "R3", "relative_positions": {"R4": {"dx_mm": 3,
+                                                                        "dy_mm": 0}}}}],
+        placement_constraints={
+            "edge_locked": [{"ref": "R5", "edge": "top"}],
+            "zone_preferences": [{"ref": "R6", "zone": "center"}],
+            "keep_out_zones": [{"ref": "R7", "clearance_mm": 1}],
+            "fixed_positions": [{"ref": "R8", "x_mm": 10, "y_mm": 10}],
+            "back_side": [{"ref": "R9"}]})
+
+
+def _locked_model():
+    """make_model with R0..R11 all locked except R10, R11, plus a KiCad
+    group (R5, R10) and an edge connector J-like part at the top edge."""
+    m = make_model()
+    for f in m.footprints:
+        f.locked = f.reference not in ("R10", "R11")
+    m.component_groups = [ComponentGroup(member_indices=[10, 5], locked=True)]
+    m.fp_to_group = {10: 0, 5: 0}
+    m.moveable_indices = [11]
+    return m
+
+
+class TestConstrainedRefs(unittest.TestCase):
+    def test_every_per_ref_key_and_group_member(self):
+        refs = constrained_refs(cset_of(_full_constraints()))
+        self.assertEqual(refs, {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9"})
+
+    def test_accepts_dict_and_ignores_malformed(self):
+        d = _full_constraints()
+        d["placement_constraints"]["edge_locked"].append("junk")
+        d["component_groups"].append("junk")
+        self.assertIn("R5", constrained_refs(d))
+        self.assertEqual(constrained_refs({}), set())
+
+
+class TestUnlockRefs(unittest.TestCase):
+    def test_unlocks_named_parts_and_their_group(self):
+        m = _locked_model()
+        cleared = unlock_refs(m, {"R1", "R5"})
+        # R5's KiCad group drags R10 along (R10 was not locked, so not listed)
+        self.assertEqual(cleared, ["R1", "R5"])
+        self.assertFalse(m.footprints[1].locked)
+        self.assertFalse(m.footprints[5].locked)
+        self.assertFalse(m.component_groups[0].locked)
+        self.assertTrue(m.footprints[2].locked)
+        # group representative is its first member (10); 5 is not separately moveable
+        self.assertEqual(sorted(m.moveable_indices), [1, 10, 11])
+
+    def test_unknown_and_unlocked_refs_are_ignored(self):
+        m = _locked_model()
+        self.assertEqual(unlock_refs(m, {"NOPE", "R11"}), [])
+        self.assertEqual(m.moveable_indices, [11])
+
+    def test_constraints_apply_to_unlocked_parts(self):
+        m = _locked_model()
+        d = _full_constraints()
+        unlock_refs(m, constrained_refs(cset_of(d)))
+        rep = apply(m, d)
+        reasons = [r for _c, _i, r in rep.skipped]
+        self.assertFalse([r for r in reasons if "locked" in r], rep.skipped)
+        self.assertEqual(rep.applied.get("edge_locked"), 1)
+        self.assertEqual(rep.applied.get("zone_preferences"), 1)
+        # fixed_positions re-locks after positioning
+        self.assertTrue(m.footprints[8].locked)
+        self.assertNotIn(8, m.moveable_indices)
+        # parts the file does not name keep their board lock
+        self.assertTrue(m.footprints[0].locked)
+        self.assertNotIn(0, m.moveable_indices)
+
+
+def _batch_runner():
+    import importlib
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+    return importlib.import_module("batch_runner")
+
+
+def _edge_model():
+    """Two J connectors on the top edge (J0 named in the file, J1 not) and a
+    locked R2 named in the file."""
+    m = make_model(n=6)
+    m.footprints[0].reference = "J0"
+    m.footprints[1].reference = "J1"
+    for f in m.footprints[:2]:
+        f.y = OY + 1 * MM
+    m.footprints[2].locked = True
+    m.footprints[3].locked = True
+    m.moveable_indices = [0, 1, 4, 5]
+    return m
+
+
+class TestBatchRunnerUnlock(unittest.TestCase):
+    def setUp(self):
+        self.br = _batch_runner()
+        self.d = base_constraints(placement_constraints={
+            "edge_locked": [{"ref": "J0", "edge": "top"}],
+            "zone_preferences": [{"ref": "R2", "zone": "center"}]})
+
+    def test_constrained_mode(self):
+        m = _edge_model()
+        n_locked, refs = self.br.prepare_locks(m, "constrained", cset_of(self.d))
+        self.assertEqual(refs, ["R2"])
+        self.assertEqual(n_locked, 1)            # J1 auto-locked, J0 not
+        self.assertFalse(m.footprints[0].locked)
+        self.assertTrue(m.footprints[1].locked)
+        self.assertTrue(m.footprints[3].locked)  # R3 not named: board lock kept
+        self.assertEqual(sorted(m.moveable_indices), [0, 2, 4, 5])
+        rep = apply(m, self.d)
+        self.assertEqual(rep.skipped, [])
+
+    def test_default_and_all_modes_unchanged(self):
+        m = _edge_model()
+        n_locked, refs = self.br.prepare_locks(m, None, cset_of(self.d))
+        self.assertEqual((n_locked, refs), (2, []))
+        m = _edge_model()
+        n_locked, refs = self.br.prepare_locks(m, "all", None)
+        self.assertEqual((n_locked, refs), (0, ["R2", "R3"]))
+        self.assertEqual(sorted(m.moveable_indices), list(range(6)))
+
+    def test_constrained_needs_constraints(self):
+        with self.assertRaises(ValueError):
+            self.br.prepare_locks(_edge_model(), "constrained", None)
+
+    def _cli(self, *unlock_args):
+        import pickle
+        import subprocess
+        tmp = tempfile.mkdtemp()
+        pkl = os.path.join(tmp, "b.pkl")
+        with open(pkl, "wb") as f:
+            pickle.dump(_edge_model(), f)
+        cj = os.path.join(tmp, "c.json")
+        with open(cj, "w") as f:
+            json.dump(self.d, f)
+        rj = os.path.join(tmp, "r.json")
+        script = os.path.join(os.path.dirname(__file__), '..', 'scripts', 'batch_runner.py')
+        p = subprocess.run([sys.executable, script, "--model", pkl, "--profile", "quick",
+                            "--seed", "1", "--constraints", cj] + list(unlock_args)
+                           + ["--result-json", rj], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(rj) as f:
+            return json.load(f)
+
+    def test_cli_bare_flag_means_all(self):
+        res = self._cli("--unlock")
+        self.assertEqual((res["unlock"], res["unlock_mode"]), (True, "all"))
+        self.assertEqual(res["unlocked_refs"], ["R2", "R3"])
+        self.assertEqual(res["edge_connectors_locked"], 0)
+        res = self._cli("--unlock", "all")
+        self.assertEqual(res["unlock_mode"], "all")
+
+    def test_cli_constrained(self):
+        res = self._cli("--unlock", "constrained")
+        self.assertEqual(res["unlock_mode"], "constrained")
+        self.assertEqual(res["unlocked_refs"], ["R2"])
+        self.assertEqual(res["unlocked_footprints"], 1)
+        self.assertEqual(res["edge_connectors_locked"], 1)
+        self.assertEqual(res["constraint_skipped_items"], [])
+
+    def test_cli_default_keeps_locks(self):
+        res = self._cli()
+        self.assertEqual((res["unlock"], res["unlock_mode"], res["unlocked_refs"]),
+                         (False, None, []))
+        # J0 auto-locked as an edge connector, R2 board-locked: both skipped
+        items = res["constraint_skipped_items"]
+        self.assertEqual(sorted(i["item"] for i in items), ["J0", "R2"])
+        self.assertTrue(all("locked" in i["reason"] for i in items))
+
 
 if __name__ == "__main__":
     unittest.main()

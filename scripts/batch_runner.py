@@ -44,7 +44,8 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 from plugin.annealer import run_sa, SAConfig
 from plugin.cost_function import CostState
-from plugin.constraints import load_constraints, apply_constraints, ConstraintError
+from plugin.constraints import (load_constraints, apply_constraints, ConstraintError,
+                                constrained_refs, unlock_refs)
 
 
 # ---------------------------------------------------------------------------
@@ -79,16 +80,19 @@ MM = 1_000_000  # nm per mm
 EDGE_CONNECTOR_MARGIN = 5 * MM  # 5 mm in nm
 
 
-def lock_edge_connectors(model) -> int:
+def lock_edge_connectors(model, exclude_refs=()) -> int:
     """Lock footprints that look like edge-mounted connectors.
 
     Heuristic: reference starts with J or P AND the footprint origin is
-    within EDGE_CONNECTOR_MARGIN of any board edge.  Returns the number of
-    footprints newly locked.
+    within EDGE_CONNECTOR_MARGIN of any board edge.  Footprints whose
+    reference is in exclude_refs are left alone (--unlock constrained: the
+    constraint file places them).  Returns the number of footprints newly
+    locked.
     """
+    exclude = set(exclude_refs)
     newly_locked = 0
     for fp in model.footprints:
-        if fp.locked:
+        if fp.locked or fp.reference in exclude:
             continue
         ref = fp.reference.upper()
         if not (ref.startswith("J") or ref.startswith("P")):
@@ -128,6 +132,34 @@ def unlock_all(model) -> int:
         in_group.update(grp.member_indices[1:])
     model.moveable_indices = [i for i in range(len(model.footprints)) if i not in in_group]
     return n
+
+
+UNLOCK_MODES = ("all", "constrained")
+
+
+def prepare_locks(model, mode, cset):
+    """Lock handling before the constraint file is applied.
+
+    mode None          keep the board's lock flags, auto-lock edge connectors
+    mode "all"         unlock_all, no edge-connector auto-lock
+    mode "constrained" unlock the footprints the constraint file names (and
+                       the KiCad groups containing them), auto-lock the other
+                       edge connectors; fixed_positions re-locks its parts
+                       when the file is applied
+
+    Returns (edge_connectors_locked, unlocked_refs).
+    """
+    if mode == "all":
+        refs = sorted(fp.reference for fp in model.footprints if fp.locked)
+        unlock_all(model)
+        return 0, refs
+    if mode == "constrained":
+        if cset is None:
+            raise ValueError("--unlock constrained needs --constraints")
+        named = constrained_refs(cset)
+        refs = unlock_refs(model, named)
+        return lock_edge_connectors(model, exclude_refs=named | set(refs)), refs
+    return lock_edge_connectors(model), []
 
 
 def compute_hpwl_mm(model) -> float:
@@ -238,13 +270,14 @@ def run_single_model(args, cset) -> int:
     config = apply_overrides(copy.copy(PROFILES[profile_name]), args)
     board_name = pkl_path.stem + ".kicad_pcb"
 
-    n_unlocked = 0
-    if args.unlock:
-        n_unlocked = unlock_all(model)
+    n_locked, unlocked_refs = prepare_locks(model, args.unlock, cset)
+    n_unlocked = len(unlocked_refs)
+    if args.unlock == "all":
         print(f"  Unlocked {n_unlocked} footprint(s); edge-connector auto-lock skipped")
-        n_locked = 0
-    else:
-        n_locked = lock_edge_connectors(model)
+    elif args.unlock == "constrained":
+        print(f"  Unlocked {n_unlocked} footprint(s) named in the constraint file"
+              f"{': ' + ', '.join(unlocked_refs) if unlocked_refs else ''}; "
+              f"edge-connector auto-lock skipped for named parts")
     report = apply_constraints(model, cset) if cset is not None else None
 
     n_move = len(model.moveable_indices)
@@ -255,7 +288,7 @@ def run_single_model(args, cset) -> int:
     print(f"  Running {board_name} ({profile_name}"
           f"{', constraints' if cset is not None else ''}"
           f"{', scatter start' if args.scatter_start else ''}"
-          f"{', unlocked' if args.unlock else ''}): {n_move} moveable{locked_str}, "
+          f"{', unlock ' + args.unlock if args.unlock else ''}): {n_move} moveable{locked_str}, "
           f"{n_nets} nets, {hpwl_before:.0f} mm HPWL ...", flush=True)
 
     t_start = time.time()
@@ -310,11 +343,15 @@ def run_single_model(args, cset) -> int:
         res["scatter_start"] = bool(args.scatter_start)
         res["edge_connectors_locked"] = n_locked
         res["unlock"] = bool(args.unlock)
+        res["unlock_mode"] = args.unlock
         res["unlocked_footprints"] = n_unlocked
+        res["unlocked_refs"] = unlocked_refs
         # SAResult.total_moves over wall time (incl. greedy); the profile log's
         # Moves/sec sums cumulative per-phase counts and reads higher
         res["moves_per_s_wall"] = round(result.total_moves / elapsed) if elapsed > 0 else None
         res["constraint_report"] = report.counts() if report is not None else None
+        res["constraint_skipped_items"] = (report.as_dict()["skipped_items"]
+                                           if report is not None else None)
         with open(args.result_json, "w") as f:
             json.dump(res, f, indent=2)
         print(f"  Result JSON: {args.result_json}")
@@ -345,10 +382,14 @@ def main():
                              "after loading each model and after edge-connector locking")
     parser.add_argument("--scatter-start", action="store_true",
                         help="Scatter start 0 too (do not seed SA with the existing placement)")
-    parser.add_argument("--unlock", action="store_true",
-                        help="Clear all KiCad lock flags from the pickle and skip the "
-                             "edge-connector auto-lock (fair experiment: only the "
-                             "constraint file fixes parts)")
+    parser.add_argument("--unlock", nargs="?", const="all", default=None,
+                        choices=UNLOCK_MODES,
+                        help="'all' (also the bare flag): clear all KiCad lock flags from "
+                             "the pickle and skip the edge-connector auto-lock (fair "
+                             "experiment: only the constraint file fixes parts). "
+                             "'constrained': clear the lock only on footprints the "
+                             "constraint file names (and KiCad groups containing them) and "
+                             "skip the edge-connector auto-lock for exactly those")
     parser.add_argument("--model", default=None,
                         help="Run one pickled BoardModel from any path (ignores the corpus "
                              "and manifest; no CSV unless --out is given)")
@@ -368,6 +409,9 @@ def main():
                              "(default) or clamp them onto the edge")
     args = parser.parse_args()
 
+    if args.unlock == "constrained" and not args.constraints:
+        print("--unlock constrained requires --constraints")
+        sys.exit(2)
     cset = None
     if args.constraints:
         try:
@@ -462,12 +506,10 @@ def main():
                 continue
 
             # Auto-lock edge connectors (scraped boards don't preserve KiCad locks)
+            n_locked, unlocked_refs = prepare_locks(model, args.unlock, cset)
             if args.unlock:
-                n_unlocked = unlock_all(model)
-                print(f"  {board_name}: unlocked {n_unlocked} footprint(s)")
-                n_locked = 0
-            else:
-                n_locked = lock_edge_connectors(model)
+                print(f"  {board_name}: unlocked {len(unlocked_refs)} footprint(s)"
+                      f" ({args.unlock})")
             if cset is not None:
                 apply_constraints(model, cset)
 
