@@ -21,6 +21,12 @@ term (or the snap / lock) did not get what it asked for:
     fixed        footprint position vs the file's x/y   error <= 1 um (apply sets it
                  (board-relative, apply_constraints)    exactly, then locks it)
 
+Antenna window (antenna_outward parts, plugin.antenna_window): where the
+antenna strip lies against the real outline polygon (window over void in a
+notch, plain edge over material, mixed, stepped, overhang). A geometry
+record, not a pass/fail of the engine and not an RF assessment; listed as
+its own block, not counted in the totals.
+
 Everything else (overlaps, boundary, keep-outs, back side, net priorities,
 signal classes, templates) is not measured here; the full checker is
 CadMust-Autopilot check_constraints.py. Note that the checker applies its own
@@ -36,7 +42,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .constraints import MM, ZONES, zone_rect_nm, facing_edge
+from .constraints import (MM, ZONES, zone_rect_nm, facing_edge, resolve_antenna_item,
+                          AntennaError)
+from .antenna_window import antenna_window, summary_line
 from .cost_function import polygon_edge_limit, anchor_edge_reference
 from .moves import EDGE_LOCK_MARGIN, _edge_snap_polygon
 
@@ -69,6 +77,9 @@ class Check:
 @dataclass
 class ConstraintSummary:
     checks: List[Check] = field(default_factory=list)
+    # antenna window records (plugin.antenna_window.AntennaWindow), one per
+    # antenna_outward part; geometry only, not in the totals
+    windows: list = field(default_factory=list)
 
     def totals(self) -> Dict[str, Tuple[int, int]]:
         """kind -> (n_pass, n_fail), only kinds that have checks."""
@@ -230,6 +241,31 @@ def measure_fixed(model, cset) -> List[Check]:
     return out
 
 
+def measure_antenna_windows(model, cset) -> list:
+    """One AntennaWindow per anchored (antenna_outward) edge-locked part that
+    has an antenna item in the file, measured on the final placement."""
+    if cset is None:
+        return []
+    items: Dict[str, dict] = {}
+    for it in (cset.placement.get("keep_out_zones") or []):
+        if isinstance(it.get("antenna"), dict):
+            items.setdefault(it.get("ref"), it)
+    poly = _edge_snap_polygon(model)
+    outline = (model.outline_xmin, model.outline_ymin,
+               model.outline_xmax, model.outline_ymax)
+    out = []
+    for fi in sorted(getattr(model, "edge_locked_indices", None) or ()):
+        f = model.footprints[fi]
+        if f.edge_anchor_world() is None or f.reference not in items:
+            continue
+        try:
+            res = resolve_antenna_item(f, items[f.reference])
+        except AntennaError:
+            continue
+        out.append(antenna_window(f, res, f.edge_lock, poly, outline))
+    return out
+
+
 def summarize(model, cset=None) -> ConstraintSummary:
     """Measure the final placement. `model` must carry the applied constraints
     (soft_groups, zone_prefs, edge_locked_indices) and the final positions."""
@@ -238,15 +274,22 @@ def summarize(model, cset=None) -> ConstraintSummary:
     s.checks.extend(measure_zones(model, cset))
     s.checks.extend(measure_edge_locks(model))
     s.checks.extend(measure_fixed(model, cset))
+    s.windows.extend(measure_antenna_windows(model, cset))
     return s
 
 
 def format_text(summary: ConstraintSummary, report=None, *, path: str = "",
                 weights: Optional[Tuple[float, float]] = None,
                 unlocked: Optional[List[str]] = None,
-                max_unlocked: int = 20) -> str:
+                max_unlocked: int = 20,
+                unselected_named: Optional[List[str]] = None) -> str:
     """Plain text for the results dialog: what was applied and skipped (from
-    the ConstraintReport), then the measured totals and every FAIL line."""
+    the ConstraintReport), then the measured totals and every FAIL line.
+
+    unlocked: references whose board lock the run disregarded (their KiCad
+    lock flag is not changed). unselected_named: under "Move selected
+    components only", the references the file names that were not selected
+    (None when the option is off)."""
     lines: List[str] = []
     if path:
         lines.append("File: %s" % path)
@@ -261,9 +304,35 @@ def format_text(summary: ConstraintSummary, report=None, *, path: str = "",
             shown = ", ".join(unlocked[:max_unlocked])
             more = " (+%d more)" % (len(unlocked) - max_unlocked) \
                 if len(unlocked) > max_unlocked else ""
-            lines.append("Board lock cleared (%d): %s%s" % (len(unlocked), shown, more))
+            lines.append("Board locks disregarded for this run (%d), lock flags kept: %s%s"
+                         % (len(unlocked), shown, more))
         else:
-            lines.append("Board lock cleared: none")
+            lines.append("Board locks disregarded for this run: none")
+    if unselected_named is not None:
+        if unselected_named:
+            lines.append("Move selected only: %d part(s) the file names were not selected "
+                         "and stay where they are (no position, side, edge or zone change; "
+                         "they still count in group spans and keep-outs): %s"
+                         % (len(unselected_named), ", ".join(unselected_named)))
+        else:
+            lines.append("Move selected only: every part the file names was selected")
+    if report is not None:
+        fa = {r: (a, b) for r, a, b in getattr(report, "flipped_angles", [])}
+        if report.flipped:
+            lines.append("Side flipped by back_side (%d):" % len(report.flipped))
+            for r in report.flipped:
+                ang = (", angle %g -> %g deg" % fa[r]) if r in fa else ""
+                lines.append("  %s front -> back%s" % (r, ang))
+        else:
+            lines.append("Side flipped by back_side: none")
+        if report.rotated:
+            lines.append("Rotated by antenna_outward (%d):" % len(report.rotated))
+            for r, a, b in report.rotated:
+                lines.append("  %s %g -> %g deg" % (r, a, b))
+        else:
+            lines.append("Rotated by antenna_outward: none")
+        lines.append("Edge-locked parts keep their orientation; the file rotates no "
+                     "other part (the run may rotate unconstrained parts).")
     if report is not None:
         if report.skipped:
             lines.append("Skipped (%d):" % len(report.skipped))
@@ -271,6 +340,15 @@ def format_text(summary: ConstraintSummary, report=None, *, path: str = "",
                 lines.append("  %s %s: %s" % (cat, item, reason))
         else:
             lines.append("Skipped: none")
+        if report.unknown_refs:
+            lines.append("Unknown references (%d): %s"
+                         % (len(report.unknown_refs), ", ".join(report.unknown_refs)))
+        if report.unknown_nets:
+            lines.append("Unknown nets (%d): %s"
+                         % (len(report.unknown_nets), ", ".join(report.unknown_nets)))
+        if report.ignored:
+            lines.append("Not used by the engine: %s" % ", ".join(
+                "%s %d" % kv for kv in report.ignored.items()))
         for w in report.warnings:
             lines.append("Warning: %s" % w)
     lines.append("")
@@ -287,6 +365,11 @@ def format_text(summary: ConstraintSummary, report=None, *, path: str = "",
         lines.append("FAIL:")
         for c in fails:
             lines.append("  %-10s %-14s %s" % (c.kind, c.item, c.detail))
+    if summary.windows:
+        lines.append("")
+        lines.append("Antenna window (geometry only, not in the totals):")
+        for w in summary.windows:
+            lines.append("  %s %s" % ("ok  " if w.status == "pass" else "WARN", summary_line(w)))
     lines.append("")
     lines.append("Not measured here: %s." % NOT_MEASURED)
     lines.append("Zone and edge use the engine's tolerance (0 mm and the 1.0 mm snap);")

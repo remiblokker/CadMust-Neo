@@ -10,7 +10,7 @@ from .cost_function import CostState
 from .annealer import run_sa, SAResult
 from .placement import save_original_positions, restore_original_positions, apply_model_to_board
 from .constraints import (load_constraints, apply_constraints, unlock_constrained,
-                          ConstraintError)
+                          restrict_to_selection, constrained_refs, ConstraintError)
 
 # Cohesion and zone weights used when a constraints file is set: the
 # CadMust-Autopilot optimize default (C = Z = 100, chosen by its weight sweep).
@@ -708,17 +708,26 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         before_model = None
         constraint_report = None
         unlocked_refs, unlocked_idx = [], []
+        unselected_named = None
         if cset is not None:
             allowed = None
+            run_cset = cset
+            selection_skips = []
             if selected_only:
-                # an unselected part stays put, even when the file names it
+                # an unselected part stays put, even when the file names it:
+                # its lock is kept, and the items that would move, turn or flip
+                # it (fixed position, back side, edge lock, zone) are dropped
                 allowed = {fp.GetReference() for fp in board.GetFootprints()
                            if fp.IsSelected()}
+                run_cset, selection_skips = restrict_to_selection(cset, allowed)
+                on_board = {f.reference for f in model.footprints}
+                unselected_named = sorted((constrained_refs(cset) & on_board) - allowed)
             before_model = copy.deepcopy(model)   # HPWL "before" = board as it is
             try:
                 _named, unlocked_refs, unlocked_idx = unlock_constrained(
                     model, cset, allowed=allowed)
-                constraint_report = apply_constraints(model, cset, log=None)
+                constraint_report = apply_constraints(model, run_cset, log=None)
+                constraint_report.skipped.extend(selection_skips)
             except Exception as e:
                 wx.MessageBox(
                     f"Applying the constraints file failed:\n\n{e}\n\n"
@@ -850,11 +859,11 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
                 if mfp.reference == vfp.reference:
                     mfp.x, mfp.y = vfp.x, vfp.y
                     mfp.set_angle(vfp.angle_deg)
-            c_summary = summarize(model, cset)
+            c_summary = summarize(model, run_cset)
             constraints_text = format_text(
                 c_summary, constraint_report, path=constraints_path,
                 weights=(config.cohesion_weight, config.zone_weight),
-                unlocked=unlocked_refs)
+                unlocked=unlocked_refs, unselected_named=unselected_named)
 
         # Build result summary for logging
         if hpwl_change_pct >= 0:

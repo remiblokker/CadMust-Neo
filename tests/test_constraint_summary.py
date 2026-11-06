@@ -293,7 +293,8 @@ class TestText(unittest.TestCase):
         self.assertIn("zone       R0", txt)
         self.assertIn("Skipped (2):", txt)          # R9 unknown, group < 2 members
         self.assertIn("Weights: cohesion 100, zone 100", txt)
-        self.assertIn("Board lock cleared (1): R0", txt)
+        self.assertIn("Board locks disregarded for this run (1), lock flags kept: R0", txt)
+        self.assertNotIn("lock cleared", txt)
         self.assertIn(FULL_CHECK, txt)
         self.assertIn("0 pass, 1 FAIL", txt)
 
@@ -305,6 +306,143 @@ class TestText(unittest.TestCase):
         txt = format_text(summarize(m, cset_of(d)), rep)
         self.assertNotIn("FAIL:", txt)
         self.assertIn("1 pass, 0 FAIL", txt)
+
+
+class TestReviewFollowupText(unittest.TestCase):
+    """2026-11-06 external review, section 2.6: lock wording, flipped and
+    rotated parts with before -> after, unknown references and unused
+    sections itemised, and what "Move selected only" does with a part the
+    file names but the user did not select."""
+
+    def test_no_disregarded_locks_wording(self):
+        m = make_model(n=4)
+        d = base_constraints()
+        txt = format_text(summarize(m, cset_of(d)), apply(m, d), unlocked=[])
+        self.assertIn("Board locks disregarded for this run: none", txt)
+        self.assertNotIn("Move selected only", txt)     # option off: no line
+
+    def test_flipped_part_listed_with_angles(self):
+        m = make_model(n=4)
+        m.footprints[1].set_angle(90.0)
+        d = base_constraints(placement_constraints={"back_side": [{"ref": "R1"}]})
+        rep = apply(m, d)
+        self.assertEqual(rep.flipped_angles, [("R1", 90.0, 270.0)])
+        txt = format_text(summarize(m, cset_of(d)), rep)
+        self.assertIn("Side flipped by back_side (1):", txt)
+        self.assertIn("R1 front -> back, angle 90 -> 270 deg", txt)
+        self.assertIn("Rotated by antenna_outward: none", txt)
+
+    def test_part_already_on_the_back_is_not_listed(self):
+        # broken case for the list: only parts the file actually flipped
+        m = make_model(n=4)
+        m.footprints[1].flip_side()
+        d = base_constraints(placement_constraints={"back_side": [{"ref": "R1"}]})
+        txt = format_text(summarize(m, cset_of(d)), apply(m, d))
+        self.assertIn("Side flipped by back_side: none", txt)
+
+    def test_rotated_part_listed(self):
+        from test_antenna_outward import board, cset
+        from test_antenna_keepout import module_fp
+        m = board(module_fp(x=37 * MM, y=37 * MM, angle=90.0))
+        c = cset("top")
+        rep = apply_constraints(m, c, log=None)
+        txt = format_text(summarize(m, c), rep)
+        self.assertIn("Rotated by antenna_outward (1):", txt)
+        self.assertIn("  U3 90 -> 0 deg", txt)
+
+    def test_unknown_refs_and_unused_sections(self):
+        m = make_model(n=4)
+        d = base_constraints(
+            placement_constraints={"zone_preferences": [{"ref": "Q7", "zone": "top-left"}]},
+            signal_classes=[{"type": "max_length", "nets": ["N1"], "max_length_mm": 10}],
+            design_notes=["note"])
+        rep = apply(m, d)
+        txt = format_text(summarize(m, cset_of(d)), rep)
+        self.assertIn("Unknown references (1): Q7", txt)
+        self.assertIn("zone_preferences Q7: reference not on the board", txt)
+        self.assertIn("Not used by the engine: signal_classes 1, design_notes 1", txt)
+
+    def test_unselected_named_parts_line(self):
+        m = make_model(n=4)
+        d = base_constraints()
+        txt = format_text(summarize(m, cset_of(d)), apply(m, d), unlocked=[],
+                          unselected_named=["R2", "R3"])
+        self.assertIn("Move selected only: 2 part(s) the file names were not selected "
+                      "and stay where they are", txt)
+        self.assertIn(": R2, R3", txt)
+        txt = format_text(summarize(m, cset_of(d)), apply(m, d), unselected_named=[])
+        self.assertIn("Move selected only: every part the file names was selected", txt)
+
+    def test_antenna_window_block(self):
+        from test_antenna_window import place, top_notch
+        from plugin.constraint_summary import measure_antenna_windows
+        from test_antenna_outward import cset
+        m, _f, w = place(40, top_notch(30, 50, 8))
+        c = cset("top")
+        c.placement["keep_out_zones"][0]["antenna"]["depth_mm"] = 6.0
+        s = summarize(m, c)
+        self.assertEqual([x.classification for x in s.windows], ["window"])
+        n_checks = len(s.checks)
+        txt = format_text(s)
+        self.assertIn("Antenna window (geometry only, not in the totals):", txt)
+        self.assertIn("ok   U3 (top edge): antenna window", txt)
+        self.assertIn("RF clearance not assessed", txt)
+        self.assertEqual(len(s.checks), n_checks)      # not counted
+        # straddling the notch wall: a warning line
+        m2, _f2, _w2 = place(32, top_notch(30, 50, 8))
+        self.assertIn("WARN U3 (top edge): strip partly over board material",
+                      format_text(summarize(m2, c)))
+        self.assertEqual(measure_antenna_windows(m, None), [])
+
+
+class TestRestrictToSelection(unittest.TestCase):
+    """Move selected only: extract_board_model locks unselected parts, but
+    apply_constraints set fixed positions and back_side flips regardless of
+    the lock, and apply_model_to_board wrote both to the board. The GUI now
+    drops those items for unselected parts (constraints.restrict_to_selection)."""
+
+    def _doc(self):
+        return base_constraints(placement_constraints={
+            "fixed_positions": [{"ref": "R0", "x_mm": 5, "y_mm": 5},
+                                {"ref": "R1", "x_mm": 9, "y_mm": 9}],
+            "back_side": [{"ref": "R2"}, {"ref": "R3"}],
+            "edge_locked": [{"ref": "R2", "edge": "top"}],
+            "zone_preferences": [{"ref": "R3", "zone": "top-left"}],
+            "keep_out_zones": [{"ref": "R2", "clearance_mm": 2}]})
+
+    def _model(self):
+        m = make_model(n=4)
+        for i in (1, 2):                       # unselected: locked at extraction
+            m.footprints[i].locked = True
+        m.moveable_indices = [0, 3]
+        return m
+
+    def test_unselected_parts_stay(self):
+        from plugin.constraints import restrict_to_selection
+        m = self._model()
+        before = [(f.x, f.y, f.is_front) for f in m.footprints]
+        c, skipped = restrict_to_selection(cset_of(self._doc()), {"R0", "R3"})
+        rep = apply_constraints(m, c, log=None)
+        self.assertEqual((m.footprints[1].x, m.footprints[1].y, m.footprints[1].is_front),
+                         before[1])
+        self.assertEqual((m.footprints[2].x, m.footprints[2].y, m.footprints[2].is_front),
+                         before[2])
+        self.assertEqual(m.footprints[0].x, OX + 5 * MM)      # selected: applied
+        self.assertFalse(m.footprints[3].is_front)
+        self.assertEqual(sorted((k, r) for k, r, _ in skipped),
+                         [("back_side", "R2"), ("edge_locked", "R2"), ("fixed_positions", "R1")])
+        self.assertEqual(rep.flipped, ["R3"])
+        self.assertEqual(rep.applied.get("keep_out_zones"), 1)   # keep-out kept
+        # the original set is untouched
+        self.assertEqual(len(cset_of(self._doc()).placement["fixed_positions"]), 2)
+
+    def test_without_the_restriction_unselected_parts_move(self):
+        # broken case = the behaviour before the fix
+        m = self._model()
+        before = (m.footprints[1].x, m.footprints[1].y)
+        rep = apply_constraints(m, cset_of(self._doc()), log=None)
+        self.assertNotEqual((m.footprints[1].x, m.footprints[1].y), before)
+        self.assertIn("R2", rep.flipped)
 
 
 class TestNoGuiImports(unittest.TestCase):

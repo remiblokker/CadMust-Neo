@@ -699,6 +699,45 @@ def unlock_constrained(model: BoardModel, constraints,
     return named, sorted(model.footprints[i].reference for i in idx), idx
 
 
+def restrict_to_selection(constraints, allowed) -> Tuple["ConstraintSet", List[Tuple[str, str, str]]]:
+    """The constraint set for a "Move selected components only" run: the
+    per-ref items that would move, turn or flip a part (fixed_positions,
+    back_side, edge_locked, zone_preferences) are dropped for every
+    reference not in `allowed`, so an unselected part stays exactly where it
+    is even when the file names it. Group members, keep-outs and net
+    priorities stay: they move nothing by themselves (an unselected member
+    of a soft group stays put and the others are pulled towards it; a
+    keep-out on an unselected part still keeps the moved parts out).
+
+    Without this, apply_constraints set the fixed position and flipped a
+    back_side part regardless of the lock that extract_board_model puts on
+    unselected parts, and apply_model_to_board wrote both to the board
+    (found 2026-11-06; edge_locked and zone items were already skipped as
+    "footprint is locked", now with the real reason).
+
+    Returns (new ConstraintSet, skipped items as (category, ref, reason))."""
+    import copy
+    allowed = set(allowed)
+    data = copy.deepcopy(constraints.data)
+    skipped: List[Tuple[str, str, str]] = []
+    pc = data.get("placement_constraints") or {}
+    for key in ("fixed_positions", "back_side", "edge_locked", "zone_preferences"):
+        items = pc.get(key)
+        if not items:
+            continue
+        keep = []
+        for it in items:
+            ref = it.get("ref") if isinstance(it, dict) else None
+            if ref is not None and ref not in allowed:
+                skipped.append((key, ref, "not selected (Move selected components only); "
+                                "the part stays where it is"))
+            else:
+                keep.append(it)
+        pc[key] = keep
+    return (ConstraintSet(data=data, path=constraints.path,
+                          warnings=list(constraints.warnings)), skipped)
+
+
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -718,6 +757,9 @@ class ConstraintReport:
     flipped: List[str] = field(default_factory=list)
     # antenna_outward edge locks rotated at apply time: (ref, from_deg, to_deg)
     rotated: List[Tuple[str, float, float]] = field(default_factory=list)
+    # the angles of the flipped parts: (ref, before_deg, after_deg); a top-bottom
+    # flip turns angle a into -a (Footprint.flip_side)
+    flipped_angles: List[Tuple[str, float, float]] = field(default_factory=list)
 
     def _applied(self, cat: str, n: int = 1) -> None:
         self.applied[cat] = self.applied.get(cat, 0) + n
@@ -894,8 +936,11 @@ def apply_constraints(model: BoardModel, cset: ConstraintSet,
             continue
         listed_back.add(idx)
         if fps[idx].is_front:
+            before = fps[idx].angle_deg % 360.0
             fps[idx].flip_side()
             rep.flipped.append(fps[idx].reference)
+            rep.flipped_angles.append((fps[idx].reference, round(before, 3),
+                                       round(fps[idx].angle_deg % 360.0, 3)))
         rep._applied("back_side")
     if pc.get("back_side"):
         unlisted = [f.reference for i, f in enumerate(fps)
