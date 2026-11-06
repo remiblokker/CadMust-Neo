@@ -439,7 +439,9 @@ def _greedy_refine(
                     cost_state.restore(snap)
 
             # Try rotations (single fp only, skip for groups — too disruptive)
-            if len(members) == 1:
+            # (never for a part whose antenna must face its locked edge)
+            if len(members) == 1 and not getattr(
+                    model.footprints[members[0]], "antenna_side", None):
                 fp = model.footprints[members[0]]
                 for rot in rotations:
                     fp.set_angle((old_states[0][3] + rot) % 360.0)

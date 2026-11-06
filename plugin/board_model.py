@@ -151,6 +151,18 @@ class Footprint:
     # (Footprint.flip_side); apply_model.py then flips it on the board too.
     # Class default, so older pickles read False.
     side_flipped: bool = False
+    # Edge lock details (set by constraints.apply_constraints; class defaults,
+    # so older pickles read "none"). overhang_ok: the part may reach past its
+    # locked edge (the boundary penalty and the off-board test clip its bbox
+    # at that edge, moves/cost_function.locked_edge_clip). antenna_side: the
+    # resolved local antenna side ("+x", "-x", "+y", "-y") of an
+    # antenna_outward edge lock, None otherwise. edge_anchor_offset_nm: the
+    # outward distance (nm, local frame at 0 degrees) from the origin to the
+    # module end along antenna_side; resnap_edges puts that line on the
+    # locked edge instead of the bbox. 0 = no anchor (bbox snap).
+    overhang_ok: bool = False
+    antenna_side: Optional[str] = None
+    edge_anchor_offset_nm: int = 0
     # Cached trig values for abs_position (updated via set_angle)
     _cos_a: float = field(init=False, repr=False, default=1.0)
     _sin_a: float = field(init=False, repr=False, default=0.0)
@@ -262,9 +274,25 @@ class Footprint:
         drs = getattr(self, 'drawing_rects', None)
         if drs:
             self.drawing_rects = {_flip_layer_name(k): my(v) for k, v in drs.items()}
+        a_side = getattr(self, 'antenna_side', None)
+        if a_side in ("+y", "-y"):
+            self.antenna_side = "-y" if a_side == "+y" else "+y"
         self.set_angle((-self.angle_deg) % 360.0)
         self.is_front = not getattr(self, 'is_front', True)
         self.side_flipped = not getattr(self, 'side_flipped', False)
+
+    def edge_anchor_world(self) -> Optional[Tuple[int, int]]:
+        """World position of the edge anchor point (the module end on the
+        antenna axis through the origin), None without an anchor."""
+        off = getattr(self, 'edge_anchor_offset_nm', 0)
+        side = getattr(self, 'antenna_side', None)
+        if not off or side is None:
+            return None
+        sgn = 1 if side[0] == "+" else -1
+        lx, ly = (sgn * off, 0) if side[1] == "x" else (0, sgn * off)
+        c, s = self._cos_a, self._sin_a
+        return (self.x + int(round(lx * c - ly * s)),
+                self.y + int(round(lx * s + ly * c)))
 
     @property
     def keepout_bboxes(self) -> List[Tuple[int, int, int, int]]:

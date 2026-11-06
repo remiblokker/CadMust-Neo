@@ -87,6 +87,12 @@ def resnap_edges(model: BoardModel, members: List[int]) -> None:
     For a rigid group locked on both axes, the x correction is computed
     first and the y snap uses the x-span after that correction; the x snap
     itself uses the y-span before the y correction.
+
+    A part with an edge anchor (an antenna_outward lock,
+    Footprint.edge_anchor_world) is snapped by that point instead of its
+    bbox: the module end lies exactly on the edge reference (no margin), the
+    courtyard beyond it hangs past the edge. The polygon reference still
+    uses the bbox span along the edge.
     """
     el = model.edge_locked_indices
     if not el:
@@ -112,37 +118,39 @@ def resnap_edges(model: BoardModel, members: List[int]) -> None:
     if x_idx is not None:
         fp = fps[x_idx]
         x1, y1, x2, y2 = fp.bbox
+        anc = fp.edge_anchor_world() if getattr(fp, "edge_anchor_offset_nm", 0) else None
         if fp.edge_lock == "left":
             ref = model.outline_xmin
             if poly is not None:
                 lim = polygon_edge_limit(poly, "left", y1, y2)
                 if lim is not None:
                     ref = int(round(lim))
-            dx = ref + EDGE_LOCK_MARGIN - x1
+            dx = ref - anc[0] if anc else ref + EDGE_LOCK_MARGIN - x1
         else:
             ref = model.outline_xmax
             if poly is not None:
                 lim = polygon_edge_limit(poly, "right", y1, y2)
                 if lim is not None:
                     ref = int(round(lim))
-            dx = ref - EDGE_LOCK_MARGIN - x2
+            dx = ref - anc[0] if anc else ref - EDGE_LOCK_MARGIN - x2
     if y_idx is not None:
         fp = fps[y_idx]
         x1, y1, x2, y2 = fp.bbox
+        anc = fp.edge_anchor_world() if getattr(fp, "edge_anchor_offset_nm", 0) else None
         if fp.edge_lock == "top":
             ref = model.outline_ymin
             if poly is not None:
                 lim = polygon_edge_limit(poly, "top", x1 + dx, x2 + dx)
                 if lim is not None:
                     ref = int(round(lim))
-            dy = ref + EDGE_LOCK_MARGIN - y1
+            dy = ref - anc[1] if anc else ref + EDGE_LOCK_MARGIN - y1
         else:
             ref = model.outline_ymax
             if poly is not None:
                 lim = polygon_edge_limit(poly, "bottom", x1 + dx, x2 + dx)
                 if lim is not None:
                     ref = int(round(lim))
-            dy = ref - EDGE_LOCK_MARGIN - y2
+            dy = ref - anc[1] if anc else ref - EDGE_LOCK_MARGIN - y2
     if dx or dy:
         for idx in members:
             fp = fps[idx]

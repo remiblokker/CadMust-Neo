@@ -38,7 +38,17 @@ Mapping onto the engine:
                          Any group with max_span_mm (template or not) also
                          gets the soft cohesion term over all present members.
     net_priorities       Net.weight (critical/high), Net.is_excluded (exclude)
-    edge_locked          Footprint.edge_lock, snapped to the edge; slides along it
+    edge_locked          Footprint.edge_lock, snapped to the edge; slides along it.
+                         overhang_ok: true sets Footprint.overhang_ok: the
+                         boundary penalty and the off-board test clip the
+                         bbox at the locked edge (other sides unchanged).
+                         antenna_outward: true (needs an antenna keep-out
+                         item for the same ref): the part is rotated so its
+                         resolved antenna side faces the locked edge
+                         (antenna_outward_angle, reported in report.rotated),
+                         the module end becomes the snap anchor
+                         (Footprint.edge_anchor_offset_nm, antenna_side) and
+                         overhang_ok is implied
     zone_preferences     BoardModel.zone_prefs (soft distance term)
     keep_out_zones       Footprint.clearance / clearance_side (overlap inflation);
                          empty layers or both F.Cu and B.Cu = ring on both
@@ -81,6 +91,7 @@ plugin GUI share it; unlock_refs / unlock_indices are its building blocks).
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -553,6 +564,39 @@ def drawing_crosscheck(fp, res: AntennaResolution, tol_nm: int = MM) -> Optional
             "ok": abs(diff) <= tol_nm}
 
 
+_SIDE_VEC = {"+x": (1, 0), "-x": (-1, 0), "+y": (0, 1), "-y": (0, -1)}
+EDGE_NORMAL = {"top": (0, -1), "bottom": (0, 1), "left": (-1, 0), "right": (1, 0)}
+
+
+def side_world_direction(side: str, angle_deg: float) -> Tuple[int, int]:
+    """World unit direction (KiCad y-down, rounded to the nearest axis) of a
+    local side at the given footprint angle, rotated like Pad.abs_position."""
+    lx, ly = _SIDE_VEC[side]
+    rad = math.radians(-angle_deg)
+    c, s = math.cos(rad), math.sin(rad)
+    wx, wy = lx * c - ly * s, lx * s + ly * c
+    if abs(wx) >= abs(wy):
+        return (1 if wx > 0 else -1, 0)
+    return (0, 1 if wy > 0 else -1)
+
+
+def facing_edge(side: str, angle_deg: float) -> str:
+    """The board edge (top/bottom/left/right) a local side faces at angle_deg."""
+    d = side_world_direction(side, angle_deg)
+    return next(e for e, n in EDGE_NORMAL.items() if n == d)
+
+
+def antenna_outward_angle(side: str, edge: str) -> float:
+    """The footprint angle (0, 90, 180 or 270 degrees) at which the local
+    side faces the given board edge. The local frame is the model's (for a
+    back-side part the mirrored, as-placed frame), so the same rotation
+    holds on both board sides."""
+    for a in (0.0, 90.0, 180.0, 270.0):
+        if side_world_direction(side, a) == EDGE_NORMAL[edge]:
+            return a
+    raise ValueError("no angle for side %r and edge %r" % (side, edge))
+
+
 # ---------------------------------------------------------------------------
 # Constrained references and selective unlock
 # ---------------------------------------------------------------------------
@@ -672,6 +716,8 @@ class ConstraintReport:
     ignored: Dict[str, int] = field(default_factory=dict)
     # back_side parts the model had on the front, flipped to the back
     flipped: List[str] = field(default_factory=list)
+    # antenna_outward edge locks rotated at apply time: (ref, from_deg, to_deg)
+    rotated: List[Tuple[str, float, float]] = field(default_factory=list)
 
     def _applied(self, cat: str, n: int = 1) -> None:
         self.applied[cat] = self.applied.get(cat, 0) + n
@@ -701,6 +747,8 @@ class ConstraintReport:
             "ignored": dict(self.ignored),
             "warnings": len(self.warnings),
             "flipped": list(self.flipped),
+            "rotated": [{"ref": r, "from_deg": a, "to_deg": b}
+                        for r, a, b in self.rotated],
         }
 
     def as_dict(self) -> dict:
@@ -718,6 +766,8 @@ class ConstraintReport:
         if self.flipped:
             lines.append("[CadMust] Flipped to the back side (back_side): %s"
                          % ", ".join(self.flipped))
+        for r, a, b in self.rotated:
+            lines.append("[CadMust] Rotated %s %g -> %g deg (antenna_outward)" % (r, a, b))
         if self.skipped:
             lines.append("[CadMust] Constraints skipped (%d):" % len(self.skipped))
             for cat, item, reason in self.skipped:
@@ -910,6 +960,10 @@ def apply_constraints(model: BoardModel, cset: ConstraintSet,
     model.soft_groups = soft_groups or None
 
     # --- edge locks ---
+    antenna_items: Dict[str, dict] = {}
+    for it in pc.get("keep_out_zones", []) or []:
+        if isinstance(it.get("antenna"), dict):
+            antenna_items.setdefault(it["ref"], it)
     edge_set = set(model.edge_locked_indices or ())
     for it in pc.get("edge_locked", []) or []:
         ref, edge = it["ref"], it["edge"]
@@ -922,6 +976,10 @@ def apply_constraints(model: BoardModel, cset: ConstraintSet,
             rep._skip("edge_locked", ref, "footprint is locked; left where it is")
             continue
         f.edge_lock = edge
+        if it.get("overhang_ok") is True:
+            f.overhang_ok = True
+        if it.get("antenna_outward") is True:
+            _apply_antenna_outward(model, idx, edge, antenna_items.get(ref), rep)
         edge_set.add(idx)
         rep._applied("edge_locked")
     model.edge_locked_indices = edge_set or None
@@ -1021,6 +1079,41 @@ def apply_constraints(model: BoardModel, cset: ConstraintSet,
     if log is not None:
         log(rep.summary())
     return rep
+
+
+def _apply_antenna_outward(model: BoardModel, idx: int, edge: str,
+                           item: Optional[dict], rep: ConstraintReport) -> None:
+    """antenna_outward on an edge lock: rotate the part so its resolved
+    antenna side faces `edge`, set the module end as its snap anchor and
+    allow the overhang. Without an antenna item, an unresolvable side or
+    inside a rigid group the lock stays a plain edge lock (warning)."""
+    f = model.footprints[idx]
+    ref = f.reference
+    if item is None:
+        rep.warnings.append("edge_locked %s: antenna_outward without an antenna keep-out "
+                            "item for %s; plain edge lock" % (ref, ref))
+        return
+    try:
+        res = resolve_antenna_item(f, item)
+    except AntennaError as e:
+        rep.warnings.append("edge_locked %s: antenna_outward ignored, antenna: %s"
+                            % (ref, e))
+        return
+    if model.fp_to_group.get(idx) is not None:
+        rep.warnings.append("edge_locked %s: antenna_outward ignored, the part is in a "
+                            "rigid group (rotating it would break the template)" % ref)
+        return
+    want = antenna_outward_angle(res.side, edge)
+    old = f.angle_deg % 360.0
+    if abs(((old - want) + 180.0) % 360.0 - 180.0) > 1e-6:
+        f.set_angle(want)
+        rep.rotated.append((ref, round(old, 3), want))
+        rep.notes.append("edge_locked %s: rotated %g -> %g deg so the antenna side %s "
+                         "faces the %s edge" % (ref, old, want, res.side, edge))
+    f.antenna_side = res.side
+    f.edge_anchor_offset_nm = int(res.antenna_end)
+    f.overhang_ok = True
+    rep._applied("antenna_outward")
 
 
 def template_position(anchor, dx_mm: float, dy_mm: float) -> Tuple[int, int]:
