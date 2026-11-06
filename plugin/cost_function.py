@@ -41,7 +41,10 @@ POLYGON_BOUNDARY_WEIGHT = 500.0  # polygon cutout violations (nm); 10× BOUNDARY
                             # so that at high T (penalty_scale_min=0.1) the effective
                             # weight equals OVERLAP_WEIGHT — preventing SA from trading
                             # cutout placement for overlap relief even at high temperature.
-KEEPOUT_WEIGHT = 100.0      # per-violation, multiplied by overlap distance (nm)
+KEEPOUT_WEIGHT = 100.0      # per-violation, multiplied by overlap distance (nm);
+                            # flat per part since 2026-11-06 (was x net count), so
+                            # at T -> 0 a keep-out intrusion costs every part 2x
+                            # an overlap of the same depth (OVERLAP_WEIGHT, flat)
 COHESION_WEIGHT = 1.0       # per soft group, times excess span (nm): 1 mm excess = 1 mm wire
 ZONE_WEIGHT = 1.0           # per footprint, times distance to preferred zone (nm)
 # Both are defaults only; CostState(cohesion_weight=, zone_weight=) and the
@@ -800,15 +803,17 @@ class CostState:
     def _compute_fp_keepout(self, fp_idx: int) -> float:
         """Compute keepout penalty for a single footprint.
 
-        Penalty scales with the footprint's net count so that
-        high-pin-count components get proportionally stronger keepout
-        penalties, matching their larger HPWL pull.
+        (ox + oy) * KEEPOUT_WEIGHT per intruded keep-out, the same per-nm
+        form as the overlap term and flat per part. Until 2026-11-06 it was
+        also multiplied by the part's net count, so a many-net part paid up
+        to 100 x nets per nm for a keep-out against a flat 50 for a
+        collision and preferred the collision. penalty_scale still applies
+        (total_cost), as before.
 
-        Uses cached bbox arrays and precomputed net scale.
+        Uses cached bbox arrays.
         """
         if self.model.footprints[fp_idx].locked or not self._keepouts:
             return 0.0
-        net_scale = self._fp_net_scale[fp_idx]
         fxmin = self._bx1[fp_idx]
         fymin = self._by1[fp_idx]
         fxmax = self._bx2[fp_idx]
@@ -820,7 +825,7 @@ class CostState:
             ox = max(0, min(fxmax, ko.xmax) - max(fxmin, ko.xmin))
             oy = max(0, min(fymax, ko.ymax) - max(fymin, ko.ymin))
             if ox > 0 and oy > 0:
-                total += (ox + oy) * KEEPOUT_WEIGHT * net_scale
+                total += (ox + oy) * KEEPOUT_WEIGHT
         return total
 
     def _compute_keepout_penalty(self) -> float:

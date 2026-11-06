@@ -233,5 +233,65 @@ class TestBackSideApply(unittest.TestCase):
         self.assertNotIn((0, 1), cs._pair_overlaps)
 
 
+# ---------------------------------------------------------------------------
+# 3. Keep-out cost scaling
+# ---------------------------------------------------------------------------
+
+from plugin.board_model import KeepOut  # noqa: E402
+from plugin.cost_function import KEEPOUT_WEIGHT, OVERLAP_WEIGHT  # noqa: E402
+from plugin.moves import do_translate, revert_move, affected_indices  # noqa: E402
+
+
+class TestKeepoutScaling(unittest.TestCase):
+    def _model_with_keepout(self):
+        m = make_model(n=8)
+        # keep-out rect 10 x 10 mm at (60, 30) mm absolute
+        m.keepouts = [KeepOut(xmin=60 * MM, ymin=30 * MM, xmax=70 * MM, ymax=40 * MM)]
+        return m
+
+    def test_flat_per_part(self):
+        m = self._model_with_keepout()
+        many = m.footprints[4]           # R4: 4 nets (chain x2, fan-out, GND)
+        few = m.footprints[3]            # R3: 3 nets
+        self.assertNotEqual(len(many.net_codes), len(few.net_codes))
+        for f in (many, few):
+            f.x, f.y = 61 * MM, 31 * MM  # bbox 3x2 mm: corner at 59.5/30 -> intrusion
+        cs = CostState(m, quiet=True)
+        self.assertAlmostEqual(cs._fp_keepout[4], cs._fp_keepout[3])
+        x1, y1, x2, y2 = many.bbox
+        ox = min(x2, 70 * MM) - max(x1, 60 * MM)
+        oy = min(y2, 40 * MM) - max(y1, 30 * MM)
+        self.assertAlmostEqual(cs._fp_keepout[4], (ox + oy) * KEEPOUT_WEIGHT)
+        self.assertGreaterEqual(KEEPOUT_WEIGHT, OVERLAP_WEIGHT)
+
+    def test_penalty_scale_still_applies(self):
+        m = self._model_with_keepout()
+        m.footprints[0].x, m.footprints[0].y = 65 * MM, 35 * MM
+        cs = CostState(m, quiet=True)
+        ko = cs._keepout_penalty
+        self.assertGreater(ko, 0)
+        full = cs.total_cost
+        cs.update_penalty_scale(0.1)
+        self.assertAlmostEqual(full - cs.total_cost,
+                               0.9 * (ko + cs._boundary_penalty + cs._soft_penalty
+                                      + cs._congestion_penalty), places=3)
+        self.assertAlmostEqual(cs.normalized_cost, full)
+
+    def test_incremental_matches_full(self):
+        m = self._model_with_keepout()
+        cs = CostState(m, quiet=True)
+        rnd = random.Random(5)
+        random.seed(5)
+        for _ in range(300):
+            undo = do_translate(m, rnd.random(), 20 * MM)
+            cs.incremental_update(affected_indices(undo))
+            if rnd.random() < 0.5:
+                revert_move(m, undo)
+                cs.incremental_update(affected_indices(undo))
+        inc = cs._keepout_penalty
+        cs._compute_all()
+        self.assertAlmostEqual(inc, cs._keepout_penalty, places=3)
+
+
 if __name__ == "__main__":
     unittest.main()
