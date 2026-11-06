@@ -41,7 +41,10 @@ POLYGON_BOUNDARY_WEIGHT = 500.0  # polygon cutout violations (nm); 10× BOUNDARY
                             # so that at high T (penalty_scale_min=0.1) the effective
                             # weight equals OVERLAP_WEIGHT — preventing SA from trading
                             # cutout placement for overlap relief even at high temperature.
-KEEPOUT_WEIGHT = 100.0      # per-violation, multiplied by overlap distance (nm)
+KEEPOUT_WEIGHT = 100.0      # per-violation, multiplied by overlap distance (nm);
+                            # flat per part since 2026-11-06 (was x net count), so
+                            # at T -> 0 a keep-out intrusion costs every part 2x
+                            # an overlap of the same depth (OVERLAP_WEIGHT, flat)
 COHESION_WEIGHT = 1.0       # per soft group, times excess span (nm): 1 mm excess = 1 mm wire
 ZONE_WEIGHT = 1.0           # per footprint, times distance to preferred zone (nm)
 # Both are defaults only; CostState(cohesion_weight=, zone_weight=) and the
@@ -383,7 +386,8 @@ class CostState:
                  congestion_weight: float = 0.0,
                  congestion_bin_size: int = 5_000_000,
                  cohesion_weight: float = COHESION_WEIGHT,
-                 zone_weight: float = ZONE_WEIGHT):
+                 zone_weight: float = ZONE_WEIGHT,
+                 pad_clearance: bool = False):
         self.model = model
         self.net_hpwl: Dict[int, int] = {}
         self._total_hpwl: int = 0
@@ -420,6 +424,18 @@ class CostState:
             i for i, fp in enumerate(model.footprints)
             if getattr(fp, 'keepout_rects', None)]
         self._ko_world: Dict[int, List[Tuple[int, int, int, int]]] = {}
+        # Pad-level clearance (docs/PAD_CLEARANCE_DESIGN.md): per-fp local pad
+        # tuples (x1, y1, x2, y2, side mask, clearance, net), world copies
+        # cached per position, and the local pad reach (pads inflated by
+        # their clearance) of the fps whose reach can exceed their bbox.
+        self._pad_on: bool = bool(pad_clearance)
+        self._pad_local: Dict[int, List[tuple]] = {}
+        self._pad_world: Dict[int, tuple] = {}
+        self._pr_local: Dict[int, Tuple[int, int, int, int]] = {}
+        self._pr_world: Dict[int, Tuple[int, int, int, int]] = {}
+        self._pad_maxc: Dict[int, int] = {}
+        if self._pad_on:
+            self._build_pad_data()
         self._rebuild_bbox_arrays()
 
         # Sub-timers for profiling incremental_update breakdown
@@ -483,11 +499,15 @@ class CostState:
         self._clear_fps: List[int] = [i for i, c in enumerate(self._fp_clear) if c > 0]
         # Fps whose overlap reach exceeds their bbox (ring or attached rects);
         # the neighbour scan tests them explicitly.
-        self._ext_fps: List[int] = sorted(set(self._clear_fps) | set(self._ko_fps))
-        if self._ext_fps:
+        self._ext_fps: List[int] = sorted(set(self._clear_fps) | set(self._ko_fps)
+                                          | set(self._pr_local))
+        if set(self._clear_fps) | set(self._ko_fps):
             # Shadow the plain pair test with the clearance-aware one; boards
             # without clearances or attached rects keep the original method.
             self._compute_pair_overlap = self._compute_pair_overlap_clear
+        if self._pad_on and self._pad_local:
+            self._pair_base = self._compute_pair_overlap
+            self._compute_pair_overlap = self._compute_pair_overlap_pad
 
         # Cached board extents — avoid self.model.X attribute chain in hot path.
         self._oxmin: int = model.outline_xmin
@@ -546,6 +566,108 @@ class CostState:
                                   for i in range(len(self.model.footprints)))
         for i in self._ko_fps:
             self._ko_world[i] = self.model.footprints[i].keepout_bboxes
+        for i, r in self._pr_local.items():
+            self._pr_world[i] = self.model.footprints[i].local_rect_to_world(r)
+
+    _PAD_MASK = {"F": 1, "B": 2, "TH": 3}
+
+    def _build_pad_data(self) -> None:
+        """Collect the pads with copper data; fps whose pad reach (pad rect
+        inflated by its clearance) leaves the bbox get a reach rect."""
+        for i, fp in enumerate(self.model.footprints):
+            rows = []
+            for p in fp.pads:
+                r = getattr(p, 'rect', None)
+                m = self._PAD_MASK.get(getattr(p, 'side', ""), 0)
+                if r is None or not m:
+                    continue
+                rows.append((r[0], r[1], r[2], r[3], m,
+                             int(getattr(p, 'clearance', 0) or 0), p.net_code))
+            if not rows:
+                continue
+            self._pad_local[i] = rows
+            self._pad_maxc[i] = max(t[5] for t in rows)
+            if any(t[5] for t in rows):
+                rx1 = min(t[0] - t[5] for t in rows); ry1 = min(t[1] - t[5] for t in rows)
+                rx2 = max(t[2] + t[5] for t in rows); ry2 = max(t[3] + t[5] for t in rows)
+                lb = fp.local_bbox
+                if rx1 < lb[0] or ry1 < lb[1] or rx2 > lb[2] or ry2 > lb[3]:
+                    self._pr_local[i] = (rx1, ry1, rx2, ry2)
+
+    def _pads_world(self, fi: int) -> List[tuple]:
+        fp = self.model.footprints[fi]
+        key = (fp.x, fp.y, fp.angle_deg)
+        c = self._pad_world.get(fi)
+        if c is not None and c[0] == key:
+            return c[1]
+        to_w = fp.local_rect_to_world
+        rows = []
+        for t in self._pad_local[fi]:
+            w = to_w((t[0], t[1], t[2], t[3]))
+            rows.append((w[0], w[1], w[2], w[3], t[4], t[5], t[6]))
+        self._pad_world[fi] = (key, rows)
+        return rows
+
+    def pad_conflict_depth(self, i: int, j: int) -> int:
+        """Largest (ox + oy) of a pad of i inflated by the required clearance
+        against a pad of j (shared copper side, not the same non-zero net);
+        0 when none. Same-group pairs are not exempt here (callers decide)."""
+        if i not in self._pad_local or j not in self._pad_local:
+            return 0
+        pi = self._pads_world(i)
+        pj = self._pads_world(j)
+        # Exact prefilter: a pad can only conflict with a pad of the other
+        # part if, inflated by the largest clearance that can apply, it
+        # reaches the other part's reach rect (which contains all its pads).
+        ri = self._reach(i)
+        rj = self._reach(j)
+        cj = self._pad_maxc[j]
+        ci = self._pad_maxc[i]
+        pi = [a for a in pi
+              if a[0] - (a[5] if a[5] > cj else cj) < rj[2]
+              and a[2] + (a[5] if a[5] > cj else cj) > rj[0]
+              and a[1] - (a[5] if a[5] > cj else cj) < rj[3]
+              and a[3] + (a[5] if a[5] > cj else cj) > rj[1]]
+        if not pi:
+            return 0
+        pj = [b for b in pj
+              if b[0] - (b[5] if b[5] > ci else ci) < ri[2]
+              and b[2] + (b[5] if b[5] > ci else ci) > ri[0]
+              and b[1] - (b[5] if b[5] > ci else ci) < ri[3]
+              and b[3] + (b[5] if b[5] > ci else ci) > ri[1]]
+        v = 0
+        for a in pi:
+            ax1, ay1, ax2, ay2, am, ac, an = a
+            for b in pj:
+                if not (am & b[4]):
+                    continue
+                if an and an == b[6]:
+                    continue
+                req = ac if ac > b[5] else b[5]
+                ox = min(ax2 + req, b[2]) - max(ax1 - req, b[0])
+                if ox <= 0:
+                    continue
+                oy = min(ay2 + req, b[3]) - max(ay1 - req, b[1])
+                if oy <= 0:
+                    continue
+                if ox + oy > v:
+                    v = ox + oy
+        return v
+
+    def _compute_pair_overlap_pad(self, i: int, j: int) -> float:
+        """Pair value with the pad-level clearance term: max(courtyard/ring
+        value, pad conflict depth * OVERLAP_WEIGHT); same-group pairs exempt."""
+        base = self._pair_base(i, j)
+        if i not in self._pad_local or j not in self._pad_local:
+            return base
+        ri = self._pr_world.get(i) or (self._bx1[i], self._by1[i], self._bx2[i], self._by2[i])
+        rj = self._pr_world.get(j) or (self._bx1[j], self._by1[j], self._bx2[j], self._by2[j])
+        if not (ri[0] < rj[2] and rj[0] < ri[2] and ri[1] < rj[3] and rj[1] < ri[3]):
+            return base
+        if self._same_group(i, j):
+            return base
+        v = self.pad_conflict_depth(i, j) * OVERLAP_WEIGHT
+        return v if v > base else base
 
     def _update_bbox(self, fi: int) -> None:
         """Update bbox arrays and sorted xmin list for a single footprint."""
@@ -564,6 +686,9 @@ class CostState:
         bisect.insort(self._xmin_items, (x1, fi))
         if fi in self._ko_world:
             self._ko_world[fi] = self.model.footprints[fi].keepout_bboxes
+        r = self._pr_local.get(fi)
+        if r is not None:
+            self._pr_world[fi] = self.model.footprints[fi].local_rect_to_world(r)
 
     def _reach(self, fi: int) -> Tuple[int, int, int, int]:
         """Overlap reach of one fp: its bbox inflated by its clearance ring,
@@ -571,6 +696,12 @@ class CostState:
         c = self._fp_clear[fi]
         x1 = self._bx1[fi] - c; y1 = self._by1[fi] - c
         x2 = self._bx2[fi] + c; y2 = self._by2[fi] + c
+        pr = self._pr_world.get(fi)
+        if pr is not None:
+            if pr[0] < x1: x1 = pr[0]
+            if pr[1] < y1: y1 = pr[1]
+            if pr[2] > x2: x2 = pr[2]
+            if pr[3] > y2: y2 = pr[3]
         for r in self._ko_world.get(fi, ()):
             if r[0] < x1: x1 = r[0]
             if r[1] < y1: y1 = r[1]
@@ -800,15 +931,17 @@ class CostState:
     def _compute_fp_keepout(self, fp_idx: int) -> float:
         """Compute keepout penalty for a single footprint.
 
-        Penalty scales with the footprint's net count so that
-        high-pin-count components get proportionally stronger keepout
-        penalties, matching their larger HPWL pull.
+        (ox + oy) * KEEPOUT_WEIGHT per intruded keep-out, the same per-nm
+        form as the overlap term and flat per part. Until 2026-11-06 it was
+        also multiplied by the part's net count, so a many-net part paid up
+        to 100 x nets per nm for a keep-out against a flat 50 for a
+        collision and preferred the collision. penalty_scale still applies
+        (total_cost), as before.
 
-        Uses cached bbox arrays and precomputed net scale.
+        Uses cached bbox arrays.
         """
         if self.model.footprints[fp_idx].locked or not self._keepouts:
             return 0.0
-        net_scale = self._fp_net_scale[fp_idx]
         fxmin = self._bx1[fp_idx]
         fymin = self._by1[fp_idx]
         fxmax = self._bx2[fp_idx]
@@ -820,7 +953,7 @@ class CostState:
             ox = max(0, min(fxmax, ko.xmax) - max(fxmin, ko.xmin))
             oy = max(0, min(fymax, ko.ymax) - max(fymin, ko.ymin))
             if ox > 0 and oy > 0:
-                total += (ox + oy) * KEEPOUT_WEIGHT * net_scale
+                total += (ox + oy) * KEEPOUT_WEIGHT
         return total
 
     def _compute_keepout_penalty(self) -> float:

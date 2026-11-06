@@ -25,8 +25,11 @@ engine and the checker agree):
 Mapping onto the engine:
 
     fixed_positions      position set, footprint locked
-    back_side            Footprint.is_front = False (static; no flip move,
-                         pad geometry is not mirrored)
+    back_side            a part on the front is flipped (Footprint.flip_side:
+                         geometry mirrored as KiCad's top-bottom flip, angle
+                         negated) and listed in report.flipped; apply_model.py
+                         flips it on the board. Parts on the back that the
+                         file does not list stay there (noted). No flip move.
     component_groups     with template: members placed at the template offsets
                          from the anchor, registered as a rigid ComponentGroup.
                          Offsets are in the ANCHOR frame (at anchor angle 0):
@@ -663,6 +666,8 @@ class ConstraintReport:
     unknown_refs: List[str] = field(default_factory=list)
     unknown_nets: List[str] = field(default_factory=list)
     ignored: Dict[str, int] = field(default_factory=dict)
+    # back_side parts the model had on the front, flipped to the back
+    flipped: List[str] = field(default_factory=list)
 
     def _applied(self, cat: str, n: int = 1) -> None:
         self.applied[cat] = self.applied.get(cat, 0) + n
@@ -691,6 +696,7 @@ class ConstraintReport:
             "unknown_nets": list(self.unknown_nets),
             "ignored": dict(self.ignored),
             "warnings": len(self.warnings),
+            "flipped": list(self.flipped),
         }
 
     def as_dict(self) -> dict:
@@ -705,6 +711,9 @@ class ConstraintReport:
         lines = []
         applied = ", ".join("%s %d" % kv for kv in self.applied.items()) or "nothing"
         lines.append("[CadMust] Constraints applied: %s" % applied)
+        if self.flipped:
+            lines.append("[CadMust] Flipped to the back side (back_side): %s"
+                         % ", ".join(self.flipped))
         if self.skipped:
             lines.append("[CadMust] Constraints skipped (%d):" % len(self.skipped))
             for cat, item, reason in self.skipped:
@@ -820,12 +829,27 @@ def apply_constraints(model: BoardModel, cset: ConstraintSet,
         rep._applied("fixed_positions")
 
     # --- back side ---
+    # The file wins: a listed part the model has on the front is flipped to
+    # the back (Footprint.flip_side mirrors its geometry as KiCad does) and
+    # reported in rep.flipped. The schema has no front-side list, so a part
+    # on the back that the file does not list stays where it is (noted).
+    listed_back = set()
     for it in pc.get("back_side", []) or []:
         idx = lookup("back_side", it["ref"])
         if idx is None:
             continue
-        fps[idx].is_front = False
+        listed_back.add(idx)
+        if fps[idx].is_front:
+            fps[idx].flip_side()
+            rep.flipped.append(fps[idx].reference)
         rep._applied("back_side")
+    if pc.get("back_side"):
+        unlisted = [f.reference for i, f in enumerate(fps)
+                    if not f.is_front and i not in listed_back]
+        if unlisted:
+            rep.notes.append("%d part(s) on the back side are not in back_side and "
+                             "stay on the back (no front-side declaration in the "
+                             "schema): %s" % (len(unlisted), ", ".join(unlisted)))
 
     # --- net priorities ---
     np_ = cset.net_priorities

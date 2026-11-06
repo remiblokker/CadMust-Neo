@@ -71,6 +71,15 @@ class Pad:
     net_name: str
     offset_x: int              # pad offset from footprint center at 0° rotation (nm)
     offset_y: int
+    # Copper geometry for the pad-level clearance term (2026-11-06). Plain
+    # defaults are class attributes, so older pickles read "no data".
+    # rect: local bbox at 0 degrees relative to the fp origin (nm), the
+    # th_rects convention; side: "F", "B", "TH" (both sides) or "" (no
+    # outer copper); clearance: pad local clearance, else the footprint's,
+    # else 0 (nm).
+    rect: Optional[Tuple[int, int, int, int]] = None
+    side: str = ""
+    clearance: int = 0
 
     def abs_position(self, fp_x: int, fp_y: int, angle_deg: float) -> Tuple[int, int]:
         """Compute absolute pad position given footprint center and rotation.
@@ -84,6 +93,15 @@ class Pad:
         rx = int(self.offset_x * cos_a - self.offset_y * sin_a)
         ry = int(self.offset_x * sin_a + self.offset_y * cos_a)
         return (fp_x + rx, fp_y + ry)
+
+
+def _flip_layer_name(name: str) -> str:
+    """F.Fab <-> B.Fab etc.; layers without a side prefix stay."""
+    if name.startswith("F."):
+        return "B." + name[2:]
+    if name.startswith("B."):
+        return "F." + name[2:]
+    return name
 
 
 @dataclass
@@ -129,6 +147,10 @@ class Footprint:
     # cross-checks (a Fab outline may be drawn as large as the courtyard).
     # Never defines a keep-out. None = none / old model.
     drawing_rects: Optional[Dict[str, Tuple[int, int, int, int]]] = None
+    # True when apply_constraints moved the part to the other board side
+    # (Footprint.flip_side); apply_model.py then flips it on the board too.
+    # Class default, so older pickles read False.
+    side_flipped: bool = False
     # Cached trig values for abs_position (updated via set_angle)
     _cos_a: float = field(init=False, repr=False, default=1.0)
     _sin_a: float = field(init=False, repr=False, default=0.0)
@@ -207,6 +229,43 @@ class Footprint:
         return (self.x + int(round(min(xs))), self.y + int(round(min(ys))),
                 self.x + int(round(max(xs))), self.y + int(round(max(ys))))
 
+    def flip_side(self) -> None:
+        """Move the part to the other board side, in place.
+
+        Mirrors the footprint exactly as KiCad's FOOTPRINT::Flip(position,
+        FLIP_DIRECTION_TOP_BOTTOM) does around the footprint's own origin:
+        the position stays, every local y (pads, courtyard bbox offset, TH
+        rects, attached keep-out rects, drawing rects) is negated, and the
+        orientation becomes -angle. A model extracted from the flipped board
+        then has the same local geometry and angle, because extraction
+        un-rotates the as-placed (already mirrored) pad positions. The bbox
+        width/height do not change. Toggles is_front and side_flipped.
+        """
+        def my(r):
+            return (r[0], -r[3], r[2], -r[1])
+        for pad in self.pads:
+            pad.offset_y = -pad.offset_y
+            r = getattr(pad, 'rect', None)
+            if r is not None:
+                pad.rect = my(r)
+            ps = getattr(pad, 'side', "")
+            if ps in ("F", "B"):
+                pad.side = "B" if ps == "F" else "F"
+        self.cy_offset = -self.cy_offset
+        self.th_rects = [my(r) for r in (getattr(self, 'th_rects', None) or [])]
+        ko = getattr(self, 'keepout_rects', ())
+        if ko:
+            self.keepout_rects = tuple(my(r) for r in ko)
+        dr = getattr(self, 'drawing_rect', None)
+        if dr is not None:
+            self.drawing_rect = my(dr)
+        drs = getattr(self, 'drawing_rects', None)
+        if drs:
+            self.drawing_rects = {_flip_layer_name(k): my(v) for k, v in drs.items()}
+        self.set_angle((-self.angle_deg) % 360.0)
+        self.is_front = not getattr(self, 'is_front', True)
+        self.side_flipped = not getattr(self, 'side_flipped', False)
+
     @property
     def keepout_bboxes(self) -> List[Tuple[int, int, int, int]]:
         """World-space rects of the attached keep-outs (empty if none)."""
@@ -273,6 +332,46 @@ class BoardModel:
     soft_groups: Optional[List[Tuple[str, List[int], int]]] = None
     # Zone preferences: fp_index -> preferred zone rect (xmin, ymin, xmax, ymax) in nm.
     zone_prefs: Optional[Dict[int, Tuple[float, float, float, float]]] = None
+
+
+def _opt_nm(v) -> int:
+    """KiCad 9+ returns std::optional<int> (None or int), older an int."""
+    try:
+        return max(0, int(v)) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pad_copper(pad, pos, cos_a, sin_a, has_hole, fp_clearance):
+    """(rect, side, clearance) of one pad for the pad-clearance term.
+
+    rect: the pad's world bbox (pad.GetBoundingBox, rotation included)
+    un-rotated into the footprint frame at 0 degrees, as a bbox; exact for
+    parts at multiples of 90 degrees.
+    """
+    import pcbnew as pcbnew_mod
+    bb = pad.GetBoundingBox()
+    xs, ys = [], []
+    for wx, wy in ((bb.GetLeft(), bb.GetTop()), (bb.GetRight(), bb.GetTop()),
+                   (bb.GetRight(), bb.GetBottom()), (bb.GetLeft(), bb.GetBottom())):
+        dx = wx - pos.x
+        dy = wy - pos.y
+        xs.append(dx * cos_a - dy * sin_a)
+        ys.append(dx * sin_a + dy * cos_a)
+    rect = (int(round(min(xs))), int(round(min(ys))),
+            int(round(max(xs))), int(round(max(ys))))
+    if has_hole:
+        side = "TH"
+    elif pad.IsOnLayer(pcbnew_mod.F_Cu):
+        side = "F"
+    elif pad.IsOnLayer(pcbnew_mod.B_Cu):
+        side = "B"
+    else:
+        side = ""
+    clr = _opt_nm(pad.GetLocalClearance())
+    if not clr:
+        clr = fp_clearance
+    return rect, side, clr
 
 
 def _rule_area_forbids_footprints(zone) -> bool:
@@ -562,6 +661,7 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
         cos_a = math.cos(rad)
         sin_a = math.sin(rad)
 
+        fp_clearance = _opt_nm(getattr(fp, "GetLocalClearance", lambda: None)())
         for j, pad in enumerate(fp.Pads()):
             pad_pos = pad.GetPosition()
             nc = pad.GetNetCode()
@@ -610,6 +710,11 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
                 offset_x=offset_x,
                 offset_y=offset_y,
             )
+            try:
+                p.rect, p.side, p.clearance = _pad_copper(
+                    pad, pos, cos_a, sin_a, has_hole, fp_clearance)
+            except Exception:
+                pass   # no copper data: the pad-clearance term skips the pad
             pads_list.append(p)
 
             if nc > 0:

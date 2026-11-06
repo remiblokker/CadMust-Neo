@@ -63,6 +63,12 @@ class SAConfig:
     # off-board proposal exactly on the edge.
     offboard: str = "reject"
 
+    # Pad-level clearance term (docs/PAD_CLEARANCE_DESIGN.md): copper pads of
+    # different footprints closer than their local clearance (or touching)
+    # cost like a courtyard overlap of the same depth. Needs pad copper data
+    # (models extracted from 2026-11-06 on); older pickles are unaffected.
+    pad_clearance: bool = False
+
 
 @dataclass
 class SAResult:
@@ -75,6 +81,11 @@ class SAResult:
     total_moves: int
     accepted_moves: int
     cost_history: List[Tuple[int, float]] = field(default_factory=list)
+    # Raw HPWL (nm) of each start's starting state, measured after the
+    # restore/scatter and before T0 calibration: the placement the SA of that
+    # start actually began from. start_hpwls[0] is the designer placement
+    # unless scatter_first_start is set.
+    start_hpwls: List[int] = field(default_factory=list)
 
 
 def auto_calibrate_t0(
@@ -600,7 +611,8 @@ def run_sa(
                            congestion_weight=config.congestion_weight,
                            congestion_bin_size=config.congestion_bin_size,
                            cohesion_weight=config.cohesion_weight,
-                           zone_weight=config.zone_weight)
+                           zone_weight=config.zone_weight,
+                           pad_clearance=config.pad_clearance)
     initial_cost = cost_state.total_cost
 
     # Global best across all starts — initialised to +inf so the first start
@@ -610,6 +622,7 @@ def run_sa(
     global_best_positions = _snapshot_positions(model)
 
     cost_history: List[Tuple[int, float]] = [(0, global_best_cost)]
+    start_hpwls: List[int] = []
     total_moves = 0
     total_accepted = 0
     total_steps = 0
@@ -636,7 +649,9 @@ def run_sa(
                                congestion_weight=config.congestion_weight,
                                congestion_bin_size=config.congestion_bin_size,
                                cohesion_weight=config.cohesion_weight,
-                               zone_weight=config.zone_weight)
+                               zone_weight=config.zone_weight,
+                               pad_clearance=config.pad_clearance)
+        start_hpwls.append(int(cost_state.hpwl))
 
         # Calibrate T0 for this starting placement
         t0 = auto_calibrate_t0(model, cost_state, config)
@@ -781,6 +796,7 @@ def run_sa(
         total_moves=total_moves,
         accepted_moves=total_accepted,
         cost_history=cost_history,
+        start_hpwls=start_hpwls,
     )
 
 

@@ -31,13 +31,35 @@ def restore_original_positions(board, positions: List[Tuple[str, int, int, float
     pcbnew.Refresh()
 
 
-def apply_model_to_board(board, model: BoardModel, override_lock_indices=()):
+def set_board_side(kfp, is_front: bool) -> bool:
+    """Put a pcbnew footprint on the given side with a top-bottom flip around
+    its own position (the mirror Footprint.flip_side models). Returns True
+    when it flipped. KiCad 9+ takes a FLIP_DIRECTION, KiCad 7/8 a bool
+    aFlipLeftRight (False = top-bottom)."""
+    import pcbnew
+    if bool(kfp.IsFlipped()) == (not is_front):
+        return False
+    pos = kfp.GetPosition()
+    direction = getattr(pcbnew, "FLIP_DIRECTION_TOP_BOTTOM", None)
+    if direction is not None:
+        kfp.Flip(pos, direction)
+    else:
+        kfp.Flip(pos, False)
+    return True
+
+
+def apply_model_to_board(board, model: BoardModel, override_lock_indices=()) -> List[str]:
     """Write the optimized positions from the BoardModel back to pcbnew.
 
-    KiCad-locked footprints are skipped, except the model indices in
+    Footprints the constraint file moved to the other side
+    (Footprint.side_flipped) are flipped on the board first, also when they
+    are locked there (the side is a constraint, not an SA move). KiCad-locked
+    footprints are otherwise skipped, except the model indices in
     override_lock_indices: parts whose board lock the run cleared because a
     constraint file names them (constraints.unlock_constrained). Their KiCad
-    lock flag is left as it is; only the position is written."""
+    lock flag is left as it is; only the position is written. Returns the
+    references flipped.
+    """
     import pcbnew
 
     override = set(override_lock_indices)
@@ -51,16 +73,24 @@ def apply_model_to_board(board, model: BoardModel, override_lock_indices=()):
             pass
         fps_by_ref[fp.GetReference()] = fp
 
+    flipped: List[str] = []
     for i, mfp in enumerate(model.footprints):
         kfp = fps_by_uuid.get(mfp.uuid_str) if mfp.uuid_str else None
         if kfp is None:
             kfp = fps_by_ref.get(mfp.reference)
         if kfp is None:
             continue
+        if getattr(mfp, "side_flipped", False):
+            if set_board_side(kfp, getattr(mfp, "is_front", True)):
+                flipped.append(mfp.reference)
         if kfp.IsLocked() and i not in override:
             continue
         kfp.SetPosition(pcbnew.VECTOR2I(mfp.x, mfp.y))
         kfp.SetOrientation(pcbnew.EDA_ANGLE(mfp.angle_deg, pcbnew.DEGREES_T))
 
     board.GetConnectivity().RecalculateRatsnest()
-    pcbnew.Refresh()
+    try:
+        pcbnew.Refresh()
+    except AttributeError:
+        pass   # no running editor (headless scripts)
+    return flipped
