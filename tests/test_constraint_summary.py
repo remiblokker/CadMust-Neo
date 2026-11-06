@@ -433,8 +433,36 @@ class TestRestrictToSelection(unittest.TestCase):
                          [("back_side", "R2"), ("edge_locked", "R2"), ("fixed_positions", "R1")])
         self.assertEqual(rep.flipped, ["R3"])
         self.assertEqual(rep.applied.get("keep_out_zones"), 1)   # keep-out kept
-        # the original set is untouched
-        self.assertEqual(len(cset_of(self._doc()).placement["fixed_positions"]), 2)
+
+    def test_original_set_is_untouched(self):
+        # internal review #5: assert on the object passed in, not on a fresh
+        # set (the action measures unselected_named on the original cset)
+        from plugin.constraints import restrict_to_selection
+        orig = cset_of(self._doc())
+        snapshot = copy.deepcopy(orig.data)
+        restrict_to_selection(orig, {"R0", "R3"})
+        restrict_to_selection(orig, {"R0", "R3"}, model=self._model())
+        self.assertEqual(orig.data, snapshot)
+        self.assertEqual(len(orig.placement["fixed_positions"]), 2)
+        self.assertEqual(sorted(constrained_refs(orig)), ["R0", "R1", "R2", "R3"])
+
+    def test_unknown_reference_stays_unknown(self):
+        # internal review #7: a reference not on the board is not "not
+        # selected"; apply_constraints lists it under unknown references
+        from plugin.constraints import restrict_to_selection
+        d = self._doc()
+        d["placement_constraints"]["fixed_positions"].append({"ref": "Q7", "x_mm": 1, "y_mm": 1})
+        m = self._model()
+        c, skipped = restrict_to_selection(cset_of(d), {"R0", "R3"}, model=m)
+        self.assertNotIn("Q7", [r for _k, r, _ in skipped])
+        rep = apply_constraints(m, c, log=None)
+        self.assertEqual(rep.unknown_refs, ["Q7"])
+        txt = format_text(summarize(m, c), rep, unselected_named=["R1", "R2"])
+        self.assertIn("Unknown references (1): Q7", txt)
+        self.assertNotIn("Q7: not selected", txt)
+        # without the model (old call) the reference is still dropped
+        _c, skipped = restrict_to_selection(cset_of(d), {"R0", "R3"})
+        self.assertIn("Q7", [r for _k, r, _ in skipped])
 
     def test_without_the_restriction_unselected_parts_move(self):
         # broken case = the behaviour before the fix
@@ -443,6 +471,140 @@ class TestRestrictToSelection(unittest.TestCase):
         rep = apply_constraints(m, cset_of(self._doc()), log=None)
         self.assertNotEqual((m.footprints[1].x, m.footprints[1].y), before)
         self.assertIn("R2", rep.flipped)
+
+
+def _group_model(selected):
+    """make_model(n=4) with a KiCad group "G1" = {R0, R1}, extracted the way
+    extract_board_model(selected_only=True) does it: unselected parts are
+    locked, a group with a locked member is locked, moveable = unlocked parts
+    outside locked groups (one representative per unlocked group)."""
+    m = make_model(n=4)
+    m.component_groups = [ComponentGroup(member_indices=[0, 1], name="G1")]
+    m.fp_to_group = {0: 0, 1: 0}
+    for f in m.footprints:
+        f.locked = f.reference not in selected
+    grp = m.component_groups[0]
+    grp.locked = any(m.footprints[i].locked for i in grp.member_indices)
+    m.moveable_indices = [i for i, f in enumerate(m.footprints)
+                          if not f.locked and (i not in m.fp_to_group
+                                               or (not grp.locked and i == 0))]
+    return m
+
+
+def _state(f):
+    return (f.x, f.y, f.angle_deg, f.is_front, f.locked)
+
+
+class TestGroupSelection(unittest.TestCase):
+    """Move selected only with a KiCad group (decision 13, internal review #3
+    = external F1): a group whose members are not all selected stays locked
+    and is not moved, and the summary names it. Batch semantics unchanged."""
+
+    def _doc(self):
+        return base_constraints(placement_constraints={
+            "edge_locked": [{"ref": "R0", "edge": "top"}],
+            "fixed_positions": [{"ref": "R1", "x_mm": 9, "y_mm": 9}]})
+
+    def _gui_run(self, selected, doc=None):
+        from plugin.constraints import restrict_to_selection
+        m = _group_model(selected)
+        before = [_state(f) for f in m.footprints]
+        cset = cset_of(doc or self._doc())
+        run_cset, skips = restrict_to_selection(cset, selected, model=m)
+        _named, cleared, idx = unlock_constrained(m, cset, allowed=selected)
+        rep = apply_constraints(m, run_cset, log=None)
+        rep.skipped.extend(skips)
+        run_sa(m, config=SAConfig(max_iterations=30, seed=1))
+        return m, before, cleared, idx, rep
+
+    def test_partly_selected_group_stays(self):
+        m, before, cleared, idx, rep = self._gui_run({"R0", "R2", "R3"})
+        self.assertEqual(_state(m.footprints[1]), before[1])     # B, unselected
+        self.assertEqual(_state(m.footprints[0]), before[0])     # A moves only with B
+        self.assertEqual(cleared, [])
+        self.assertEqual(idx, [])
+        self.assertTrue(m.component_groups[0].locked)
+        self.assertIn(("edge_locked", "R0",
+                       "group G1: not moved, member(s) R1 not selected"),
+                      rep.skipped)
+        self.assertIn("fixed_positions", [k for k, r, _ in rep.skipped if r == "R1"])
+        # the free parts did move (the run was not a no-op)
+        self.assertTrue(any(_state(m.footprints[i]) != before[i] for i in (2, 3)))
+
+    def test_summary_names_the_group(self):
+        from plugin.constraints import partial_groups
+        from plugin.constraint_summary import group_lines
+        m = _group_model({"R0", "R2", "R3"})
+        parts = partial_groups(m, {"R0", "R2", "R3"})
+        self.assertEqual(parts, [(0, "G1", ["R0"], ["R1"])])
+        line = "Move selected only, group G1: not moved, member(s) R1 not selected"
+        self.assertEqual(group_lines(parts), [line])
+        d = self._doc()
+        txt = format_text(summarize(m, cset_of(d)), apply(m, d), unselected_named=["R1"],
+                          partials=parts)
+        self.assertIn(line, txt)
+        # unnamed group: the label lists the members
+        m.component_groups[0].name = ""
+        self.assertEqual(partial_groups(m, {"R0"})[0][1], "(unnamed: R0, R1)")
+        self.assertEqual(partial_groups(m, {"R0", "R1"}), [])
+        self.assertEqual(partial_groups(m, {"R2"}), [])
+
+    def test_fully_selected_group_moves(self):
+        # edge lock only (a fixed position on R1 would lock the group)
+        doc = base_constraints(placement_constraints={
+            "edge_locked": [{"ref": "R0", "edge": "top"}]})
+        m, before, cleared, _idx, rep = self._gui_run({"R0", "R1", "R2", "R3"}, doc)
+        self.assertFalse(m.component_groups[0].locked)
+        self.assertIn("R0", [r for r in (m.footprints[i].reference
+                                         for i in (m.edge_locked_indices or ()))])
+        # the edge lock snapped the group: both members moved, by the same offset
+        self.assertNotEqual(m.footprints[0].y, before[0][1])
+        self.assertNotEqual(m.footprints[1].y, before[1][1])
+        self.assertNotIn("R0", [r for _k, r, _ in rep.skipped])
+
+    def test_batch_path_still_expands_the_group(self):
+        # batch_runner: unlock_constrained without allowed, no restriction
+        m = _group_model({"R0", "R2", "R3"})
+        _named, cleared, _idx = unlock_constrained(m, cset_of(self._doc()))
+        self.assertEqual(cleared, ["R1"])
+        self.assertFalse(m.component_groups[0].locked)
+        self.assertIn(0, m.moveable_indices)
+
+    def test_unlock_indices_selected_keeps_the_group(self):
+        m = _group_model({"R0", "R2", "R3"})
+        m.footprints[0].locked = True          # A KiCad-locked too
+        self.assertEqual(unlock_indices(m, {"R0"}, selected={"R0", "R2", "R3"}), [])
+        self.assertTrue(m.footprints[0].locked and m.footprints[1].locked)
+        self.assertEqual(unlock_indices(m, {"R0"}), [0, 1])     # no selection: expanded
+
+
+class TestMovableSelection(unittest.TestCase):
+    """The GUI precheck under Move selected only (external review F2), decided
+    after the constraints file is loaded by constraints.movable_selection."""
+
+    def test_locked_part_named_by_the_file_can_run(self):
+        from plugin.constraints import movable_selection
+        self.assertEqual(movable_selection({"J1"}, {"J1"}, {"J1", "U3"}), {"J1"})
+
+    def test_locked_part_not_named_is_refused(self):
+        from plugin.constraints import movable_selection
+        self.assertEqual(movable_selection({"J1"}, {"J1"}, {"U3"}), set())
+        self.assertEqual(movable_selection({"J1"}, {"J1"}, None), set())
+
+    def test_no_file_keeps_the_old_rule(self):
+        from plugin.constraints import movable_selection
+        self.assertEqual(movable_selection({"R1", "J1"}, {"J1"}, None), {"R1"})
+        self.assertEqual(movable_selection(set(), set(), None), set())
+
+    def test_action_calls_it_after_loading_the_file(self):
+        # the action needs pcbnew; read its source: the check comes after
+        # load_constraints and uses the file's references
+        with open(os.path.join(ROOT, "plugin", "cadmust_neo_action.py")) as fh:
+            src = fh.read()
+        run = src[src.index("    def Run(self):"):]
+        self.assertLess(run.index("cset = load_constraints(constraints_path)"),
+                        run.index("movable_selection(sel, kicad_locked, named)"))
+        self.assertNotIn("if fp.IsSelected() and not fp.IsLocked()", run)
 
 
 class TestNoGuiImports(unittest.TestCase):

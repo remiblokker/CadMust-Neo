@@ -336,6 +336,9 @@ class ComponentGroup:
     """A group of footprints that must move as a rigid body."""
     member_indices: List[int]   # footprint indices in this group
     locked: bool = False
+    # KiCad group name ("" when unnamed or for a template group); the class
+    # default keeps old pickles working
+    name: str = ""
 
 @dataclass
 class BoardModel:
@@ -875,8 +878,12 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
                 grp_locked = grp.IsLocked() or any(
                     footprints[i].locked for i in indices)
                 gi = len(component_groups)
+                try:
+                    grp_name = str(grp.GetName() or "")
+                except Exception:
+                    grp_name = ""
                 component_groups.append(ComponentGroup(
-                    member_indices=indices, locked=grp_locked))
+                    member_indices=indices, locked=grp_locked, name=grp_name))
                 for idx in indices:
                     fp_to_group[idx] = gi
     except Exception:

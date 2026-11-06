@@ -278,18 +278,28 @@ def summarize(model, cset=None) -> ConstraintSummary:
     return s
 
 
+def group_lines(partials) -> List[str]:
+    """Results-summary lines for KiCad groups that "Move selected components
+    only" left in place because not all their members were selected
+    (constraints.partial_groups; decision 13). One line per group."""
+    return ["Move selected only, group %s: not moved, member(s) %s not selected"
+            % (label, ", ".join(uns)) for _gi, label, _sel, uns in (partials or [])]
+
+
 def format_text(summary: ConstraintSummary, report=None, *, path: str = "",
                 weights: Optional[Tuple[float, float]] = None,
                 unlocked: Optional[List[str]] = None,
                 max_unlocked: int = 20,
-                unselected_named: Optional[List[str]] = None) -> str:
+                unselected_named: Optional[List[str]] = None,
+                partials=None) -> str:
     """Plain text for the results dialog: what was applied and skipped (from
     the ConstraintReport), then the measured totals and every FAIL line.
 
     unlocked: references whose board lock the run disregarded (their KiCad
     lock flag is not changed). unselected_named: under "Move selected
     components only", the references the file names that were not selected
-    (None when the option is off)."""
+    (None when the option is off). partials: constraints.partial_groups of
+    the selection, listed with group_lines."""
     lines: List[str] = []
     if path:
         lines.append("File: %s" % path)
@@ -316,6 +326,7 @@ def format_text(summary: ConstraintSummary, report=None, *, path: str = "",
                          % (len(unselected_named), ", ".join(unselected_named)))
         else:
             lines.append("Move selected only: every part the file names was selected")
+    lines.extend(group_lines(partials))
     if report is not None:
         fa = {r: (a, b) for r, a, b in getattr(report, "flipped_angles", [])}
         if report.flipped:

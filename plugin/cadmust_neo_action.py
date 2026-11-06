@@ -9,8 +9,10 @@ from .board_model import extract_board_model
 from .cost_function import CostState
 from .annealer import run_sa, SAResult
 from .placement import save_original_positions, restore_original_positions, apply_model_to_board
+from .constraint_summary import group_lines
 from .constraints import (load_constraints, apply_constraints, unlock_constrained,
-                          restrict_to_selection, constrained_refs, ConstraintError)
+                          restrict_to_selection, constrained_refs, ConstraintError,
+                          movable_selection, partial_groups)
 
 # Cohesion and zone weights used when a constraints file is set: the
 # CadMust-Autopilot optimize default (C = Z = 100, chosen by its weight sweep).
@@ -328,7 +330,7 @@ class _ResultsDialog(wx.Dialog):
     def __init__(self, parent, *, hpwl_before_mm, hpwl_after_mm, hpwl_change_pct,
                  n_overlaps, n_keepout, n_silk_moved, elapsed, total_moves,
                  accepted_moves, constraints_text=None, constraints_pass=0,
-                 constraints_fail=0):
+                 constraints_fail=0, notes_text=None):
         super().__init__(parent, title="CadMust-Neo \u2014 Results",
                          style=wx.DEFAULT_DIALOG_STYLE)
 
@@ -415,6 +417,12 @@ class _ResultsDialog(wx.Dialog):
                            f"{constraints_pass} of {n_c} met, {constraints_fail} FAIL")
 
         sizer.Add(metrics_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 16)
+
+        # notes outside the constraints box (groups left in place under
+        # Move selected only when no constraints file is set)
+        if notes_text:
+            notes_label = wx.StaticText(self, label=notes_text)
+            sizer.Add(notes_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 16)
 
         if constraints_text is not None:
             cbox = wx.StaticBox(self, label="Constraints")
@@ -657,21 +665,6 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         constraints_path = dlg.constraints_file
         dlg.Destroy()
 
-        # If "move selected only" is on, verify something is selected
-        if selected_only:
-            n_selected = sum(
-                1 for fp in board.GetFootprints()
-                if fp.IsSelected() and not fp.IsLocked()
-            )
-            if n_selected == 0:
-                wx.MessageBox(
-                    "No unlocked components are selected.\n\n"
-                    "Select the components you want to optimize in the PCB editor first,\n"
-                    "or uncheck 'Move selected components only'.",
-                    "CadMust-Neo", wx.OK | wx.ICON_WARNING,
-                )
-                return
-
         # Constraints file: load and validate before anything moves
         cset = None
         if constraints_path:
@@ -692,11 +685,36 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
                 )
                 return
 
+        # If "move selected only" is on, verify something selected can move:
+        # selected and unlocked, or selected and named by the file (its board
+        # lock is disregarded). Checked after the file is loaded (review F2).
+        if selected_only:
+            sel = {fp.GetReference() for fp in board.GetFootprints() if fp.IsSelected()}
+            kicad_locked = {fp.GetReference() for fp in board.GetFootprints()
+                            if fp.IsLocked()}
+            named = constrained_refs(cset) if cset is not None else None
+            if not movable_selection(sel, kicad_locked, named):
+                wx.MessageBox(
+                    ("No unlocked components are selected.\n\n" if cset is None else
+                     "No selected component can move: the selected ones are locked\n"
+                     "and the constraints file does not name them.\n\n")
+                    + "Select the components you want to optimize in the PCB editor first,\n"
+                    "or uncheck 'Move selected components only'.",
+                    "CadMust-Neo", wx.OK | wx.ICON_WARNING,
+                )
+                return
+
         # Save original positions for undo
         original_positions = save_original_positions(board)
 
         # Extract board model into pure Python structures
         model = extract_board_model(board, selected_only=selected_only)
+        # KiCad groups only partly selected stay locked and are not moved
+        # (decision 13); named in the results summary
+        partials = []
+        if selected_only:
+            partials = partial_groups(model, {fp.GetReference() for fp in board.GetFootprints()
+                                              if fp.IsSelected()})
 
         # Apply user's net exclusion choices (overrides auto-detection)
         for nc, net in model.nets.items():
@@ -719,7 +737,8 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
                 # it (fixed position, back side, edge lock, zone) are dropped
                 allowed = {fp.GetReference() for fp in board.GetFootprints()
                            if fp.IsSelected()}
-                run_cset, selection_skips = restrict_to_selection(cset, allowed)
+                run_cset, selection_skips = restrict_to_selection(cset, allowed,
+                                                                  model=model)
                 on_board = {f.reference for f in model.footprints}
                 unselected_named = sorted((constrained_refs(cset) & on_board) - allowed)
             before_model = copy.deepcopy(model)   # HPWL "before" = board as it is
@@ -863,7 +882,8 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
             constraints_text = format_text(
                 c_summary, constraint_report, path=constraints_path,
                 weights=(config.cohesion_weight, config.zone_weight),
-                unlocked=unlocked_refs, unselected_named=unselected_named)
+                unlocked=unlocked_refs, unselected_named=unselected_named,
+                partials=partials)
 
         # Build result summary for logging
         if hpwl_change_pct >= 0:
@@ -881,6 +901,8 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         )
         if constraints_text is not None:
             result_summary += f"\n\nConstraints\n{constraints_text}"
+        elif partials:
+            result_summary += "\n\n" + "\n".join(group_lines(partials))
 
         # Append results to profile.log so they persist even if dialog is dismissed
         try:
@@ -905,6 +927,8 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
             constraints_text=constraints_text,
             constraints_pass=c_summary.n_pass if c_summary else 0,
             constraints_fail=c_summary.n_fail if c_summary else 0,
+            notes_text=None if constraints_text is not None or not partials
+            else "\n".join(group_lines(partials)),
         )
         accepted = rdlg.ShowModal() == wx.ID_OK
         rdlg.Destroy()

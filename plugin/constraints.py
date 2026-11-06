@@ -645,15 +645,55 @@ def unlock_refs(model: BoardModel, refs) -> List[str]:
     return sorted(fps[i].reference for i in unlock_indices(model, refs))
 
 
-def unlock_indices(model: BoardModel, refs) -> List[int]:
+def group_label(model: BoardModel, gi: int) -> str:
+    """Name of KiCad group gi for messages: its KiCad name, or its member
+    references when the group has no name (ComponentGroup.name)."""
+    grp = model.component_groups[gi]
+    name = getattr(grp, "name", "") or ""
+    if name:
+        return name
+    return "(unnamed: %s)" % ", ".join(model.footprints[i].reference
+                                       for i in grp.member_indices)
+
+
+def partial_groups(model: BoardModel, selected) -> List[Tuple[int, str, List[str], List[str]]]:
+    """KiCad groups (model.component_groups as extracted, before any template
+    adds rigid groups) with some but not all members in `selected` (a set of
+    references). Under "Move selected components only" such a group stays
+    locked and is not moved (decision 13, 2026-11-06): its unselected members
+    stay put, so its selected members, which move only with the group, stay
+    put too. Returns (group index, label, selected refs, unselected refs)."""
+    selected = set(selected)
+    fps = model.footprints
+    out = []
+    for gi, grp in enumerate(model.component_groups):
+        refs = [fps[i].reference for i in grp.member_indices]
+        sel = [r for r in refs if r in selected]
+        uns = [r for r in refs if r not in selected]
+        if sel and uns:
+            out.append((gi, group_label(model, gi), sel, uns))
+    return out
+
+
+def unlock_indices(model: BoardModel, refs, selected=None) -> List[int]:
     """unlock_refs, returning the cleared footprint INDICES in index order
     (a duplicate reference pulled in through a group stays distinguishable,
-    which the plugin needs to write the part back to a KiCad-locked footprint)."""
+    which the plugin needs to write the part back to a KiCad-locked footprint).
+
+    selected: optional set of references (GUI "Move selected components only").
+    A target whose KiCad group has a member outside `selected` is not unlocked
+    and the group is not expanded or unlocked: an unselected member never
+    moves (decision 13). None (batch runner) = every group is expanded."""
     fps = model.footprints
     by_ref: Dict[str, int] = {}
     for i, f in enumerate(fps):
         by_ref.setdefault(f.reference, i)
     targets = set(by_ref[r] for r in refs if r in by_ref)
+    if selected is not None:
+        frozen = set()
+        for gi, _label, _sel, _uns in partial_groups(model, selected):
+            frozen.update(model.component_groups[gi].member_indices)
+        targets -= frozen
     groups = set()
     for idx in list(targets):
         gi = model.fp_to_group.get(idx)
@@ -689,17 +729,20 @@ def unlock_constrained(model: BoardModel, constraints,
 
     allowed: optional set of references that may be unlocked (the GUI passes
     the selected parts under "Move selected components only", so a part the
-    user left unselected stays put); None = every named part.
+    user left unselected stays put); None = every named part. With `allowed`
+    a KiCad group is unlocked only when all its members are in it
+    (unlock_indices `selected`); a partly selected group stays locked.
 
     Returns (named, cleared_refs, cleared_indices): every reference the file
     names, the sorted references whose lock was cleared, and their indices."""
     named = constrained_refs(constraints)
     refs = named if allowed is None else named & set(allowed)
-    idx = unlock_indices(model, refs)
+    idx = unlock_indices(model, refs, selected=None if allowed is None else set(allowed))
     return named, sorted(model.footprints[i].reference for i in idx), idx
 
 
-def restrict_to_selection(constraints, allowed) -> Tuple["ConstraintSet", List[Tuple[str, str, str]]]:
+def restrict_to_selection(constraints, allowed, model=None
+                          ) -> Tuple["ConstraintSet", List[Tuple[str, str, str]]]:
     """The constraint set for a "Move selected components only" run: the
     per-ref items that would move, turn or flip a part (fixed_positions,
     back_side, edge_locked, zone_preferences) are dropped for every
@@ -708,6 +751,14 @@ def restrict_to_selection(constraints, allowed) -> Tuple["ConstraintSet", List[T
     priorities stay: they move nothing by themselves (an unselected member
     of a soft group stays put and the others are pulled towards it; a
     keep-out on an unselected part still keeps the moved parts out).
+
+    model (the extracted BoardModel, recommended): then only references on
+    the board are dropped as "not selected"; an unknown reference stays in
+    the set, so apply_constraints lists it under unknown references
+    (internal review #7). And a selected member of a partly selected KiCad
+    group (partial_groups) is dropped too, with the group as the reason: the
+    group stays locked and is not moved (decision 13). Without model every
+    reference outside `allowed` is dropped (the 2026-11-06 behaviour).
 
     Without this, apply_constraints set the fixed position and flipped a
     back_side part regardless of the lock that extract_board_model puts on
@@ -718,6 +769,14 @@ def restrict_to_selection(constraints, allowed) -> Tuple["ConstraintSet", List[T
     Returns (new ConstraintSet, skipped items as (category, ref, reason))."""
     import copy
     allowed = set(allowed)
+    on_board = None
+    in_partial: Dict[str, str] = {}
+    if model is not None:
+        on_board = {f.reference for f in model.footprints}
+        for _gi, label, sel, uns in partial_groups(model, allowed):
+            for r in sel:
+                in_partial.setdefault(r, "group %s: not moved, member(s) %s not selected"
+                                      % (label, ", ".join(uns)))
     data = copy.deepcopy(constraints.data)
     skipped: List[Tuple[str, str, str]] = []
     pc = data.get("placement_constraints") or {}
@@ -728,7 +787,11 @@ def restrict_to_selection(constraints, allowed) -> Tuple["ConstraintSet", List[T
         keep = []
         for it in items:
             ref = it.get("ref") if isinstance(it, dict) else None
-            if ref is not None and ref not in allowed:
+            if ref is None or (on_board is not None and ref not in on_board):
+                keep.append(it)      # unknown: apply_constraints reports it
+            elif ref in in_partial:
+                skipped.append((key, ref, in_partial[ref]))
+            elif ref not in allowed:
                 skipped.append((key, ref, "not selected (Move selected components only); "
                                 "the part stays where it is"))
             else:
@@ -736,6 +799,22 @@ def restrict_to_selection(constraints, allowed) -> Tuple["ConstraintSet", List[T
         pc[key] = keep
     return (ConstraintSet(data=data, path=constraints.path,
                           warnings=list(constraints.warnings)), skipped)
+
+
+def movable_selection(selected, kicad_locked, named=None) -> set:
+    """The references a "Move selected components only" run can move, decided
+    on the board before extraction: selected and not KiCad-locked, or
+    selected and named by the constraints file (unlock_constrained clears the
+    board lock of a named part). named: constrained_refs of the loaded file,
+    None without a file (then a selected locked part never moves). The GUI
+    refuses the run when this is empty (external review F2: the old check ran
+    before the file was loaded and refused a selected locked part the file
+    names)."""
+    selected = set(selected)
+    out = selected - set(kicad_locked)
+    if named:
+        out |= selected & set(named)
+    return out
 
 
 # ---------------------------------------------------------------------------
