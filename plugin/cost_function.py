@@ -1032,11 +1032,20 @@ class CostState:
     def _compute_fp_keepout(self, fp_idx: int) -> float:
         """Compute keepout penalty for a single footprint.
 
-        (ox + oy) * KEEPOUT_WEIGHT per intruded keep-out, the same per-nm
-        form as the overlap term and flat per part. Until 2026-11-06 it was
-        also multiplied by the part's net count, so a many-net part paid up
-        to 100 x nets per nm for a keep-out against a flat 50 for a
-        collision and preferred the collision. penalty_scale still applies
+        (ox + oy + depth) * KEEPOUT_WEIGHT per intruded keep-out, the same
+        per-nm form as the overlap term and flat per part. ox, oy: widths of
+        the bbox / keep-out intersection; depth: keepout_intrusion_depth, the
+        shortest axis translation that takes the bbox out (decision 12,
+        2026-11-06 fix round, approved by Remi). The depth term is uncapped
+        and gives the interior a gradient towards the nearest exit: with
+        (ox + oy) alone the cost was bounded at (w + h) x 100 and flat
+        inside, so a part that entered early (penalty_scale 0.1) stayed in
+        (contested keep-out fixture: entry from 23 nets per anchor, below
+        the formula crossover of 28). A part just touching has depth 0, so
+        the boundary cost is unchanged. Until 2026-11-06 the term was also
+        multiplied by the part's net count, so a many-net part paid up to
+        100 x nets per nm for a keep-out against a flat 50 for a collision
+        and preferred the collision. penalty_scale still applies
         (total_cost), as before.
 
         Uses cached bbox arrays.
@@ -1054,7 +1063,8 @@ class CostState:
             ox = max(0, min(fxmax, ko.xmax) - max(fxmin, ko.xmin))
             oy = max(0, min(fymax, ko.ymax) - max(fymin, ko.ymin))
             if ox > 0 and oy > 0:
-                total += (ox + oy) * KEEPOUT_WEIGHT
+                depth = min(fxmax - ko.xmin, ko.xmax - fxmin, fymax - ko.ymin, ko.ymax - fymin)
+                total += (ox + oy + depth) * KEEPOUT_WEIGHT
         return total
 
     def _compute_keepout_penalty(self) -> float:

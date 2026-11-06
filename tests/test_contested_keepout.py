@@ -6,19 +6,24 @@ keep-out cost keep it out after a short seeded SA run?
 What "100 per mm" measures (plugin/cost_function.py, _compute_fp_keepout):
 for every keep-out rect the part's courtyard bbox intersects,
 
-    penalty = (ox + oy) * KEEPOUT_WEIGHT        KEEPOUT_WEIGHT = 100 per nm
+    penalty = (ox + oy + depth) * KEEPOUT_WEIGHT   KEEPOUT_WEIGHT = 100 per nm
 
 where ox and oy are the widths of the intersection rectangle along x and y
-(the overlap extents, half the perimeter of the intersection). It is
-neither the intrusion depth (the distance the part must move to get out)
-nor the distance to the keep-out edge nor the overlap area. Consequences:
+(the overlap extents, half the perimeter of the intersection) and depth is
+the intrusion depth (cost_function.keepout_intrusion_depth: the shortest
+axis translation that takes the bbox out). The depth term is decision 12
+of the 2026-11-06 fix round (approved by Remi); before it the penalty was
+(ox + oy) x 100 only. Consequences:
 
 * the cost jumps as soon as the bbox touches the keep-out: entering 0.1 mm
-  across the full width of a 2 x 1 mm part already costs (2 + 0.1) mm x 100;
-* the cost is BOUNDED: a part wholly inside a keep-out larger than itself
-  pays (w + h) x 100 wherever it stands, so inside there is no gradient
-  towards the exit, and a part whose HPWL gain from entering exceeds
-  (w + h) x 100 is better off inside (TestPenaltyBound);
+  across the full width of a 2 x 1 mm part costs (2 + 0.1 + 0.1) mm x 100
+  (before: 2.1); just touching costs nothing, as before;
+* inside, the cost grows towards the centre by 100 per mm of depth, so the
+  interior has a gradient towards the nearest exit; P at the keep-out
+  centre pays (2 + 1 + 5.5) x 100 = 850 (before: a flat 300 anywhere
+  inside, no gradient);
+* it is still bounded by the keep-out size: a part whose HPWL gain from
+  entering exceeds it ends inside (TestPenaltyBound);
 * flat per part since 2026-11-06: the net count does not scale it;
 * penalty_scale applies (0.1 at T0 rising to 1.0); the best state is
   tracked at scale 1.0;
@@ -37,17 +42,25 @@ part P 2 x 1 mm, four locked 1 x 1 mm anchors N (30, 5), S (30, 35),
 W (10, 20), E (50, 20); every anchor carries k two-pin nets to P, so the
 HPWL optimum is the keep-out centre: HPWL = const + 2k|y - 20| (+ 2k|x - 30|
 off the vertical axis). From the nearest legal position (y 14.5) to the
-centre the gain is 11k mm against a full-inside penalty of 300 mm: the
-formula crossover is k = 28 nets per anchor (a comparison of two positions,
-not the SA's behaviour). Measured with this suite's SA settings (start
-(45, 32), 60 iterations, 1 reheat, seeds 1-20; fix round 2026-11-06,
-internal review #2): no entry up to k = 20, entry from k = 23 (2 of 20
-seeds), 13/20 at k = 25, 19/20 at k = 27, 8/8 at k = 40. At k = 25 the end
-state inside costs 2050 (full cost, mm) against 2025 at the nearest legal
-point (30, 14.5): the SA settles in a worse state, not the optimum. It
-enters early at penalty_scale 0.1, and inside the flat term has no
-gradient, so getting out takes a jump of at least 5.5 mm once the scale is
-back at 1.0 (TestPenaltyBound, TestEntryBelowTheCrossover).
+centre the gain is 11k mm.
+
+Measured with this suite's SA settings (start (45, 32), 60 iterations, 1
+reheat; fix round 2026-11-06):
+
+    term             formula crossover   SA ends inside (seeds)
+    (ox + oy), old   k = 28 (300 mm)      0/20 at k = 20, 2/20 at 23,
+                                          13/20 at 25, 19/20 at 27, 8/8 at 40
+    + depth, now     k = 78 (850 mm)      0/20 at k = 20-27, 0/8 at 40, 50
+                                          and 60, 4/8 at 70, 8/8 at 78
+
+The old term trapped the SA (internal review #2): at k = 25 the end state
+inside cost 2050 (full cost, mm) against 2025 at the nearest legal point
+(30, 14.5); the part entered early at penalty_scale 0.1 and the flat
+interior gave no way back. With the depth term the interior has a gradient
+outward while 2k < 100 (k < 50, 2k = HPWL gain per mm towards the centre);
+above that it points inward, so the SA can still enter somewhat below the
+new crossover (k = 70). Formula crossovers compare two positions, not the
+SA (TestPenaltyBound, TestEntryBelowTheCrossover).
 
 Run with: python3 tests/test_contested_keepout.py -v
        or python3 tests/test_contested_keepout.py --table  (the measured table)
@@ -142,14 +155,31 @@ class TestCostDefinition(unittest.TestCase):
     def test_outside_is_zero(self):
         self.assertEqual(self._cost_at(30, 14.4), 0.0)
 
-    def test_half_perimeter_of_the_intersection(self):
-        # bbox y 14.6..15.6 at x 29..31: ox 2, oy 0.6 -> (2 + 0.6) x 100
-        self.assertAlmostEqual(self._cost_at(30, 15.1), 2.6 * KEEPOUT_WEIGHT, places=6)
+    def test_half_perimeter_plus_depth(self):
+        # bbox y 14.6..15.6 at x 29..31: ox 2, oy 0.6, depth 0.6 -> 3.2 x 100
+        self.assertAlmostEqual(self._cost_at(30, 15.1), 3.2 * KEEPOUT_WEIGHT, places=6)
 
-    def test_bounded_inside(self):
-        # wholly inside: (w + h) x 100 = 300 wherever the part stands
-        for x, y in ((30, 20), (27, 17), (33, 23.5)):
-            self.assertAlmostEqual(self._cost_at(x, y), 3 * KEEPOUT_WEIGHT, places=6)
+    def test_grows_towards_the_centre(self):
+        # wholly inside: (w + h + depth) x 100; depth = shortest exit
+        for (x, y), depth in (((30, 20), 5.5), ((27, 17), 2.5), ((33, 23.5), 2.0)):
+            self.assertAlmostEqual(self._cost_at(x, y), (3 + depth) * KEEPOUT_WEIGHT,
+                                   places=6)
+        self.assertLess(self._cost_at(30, 16), self._cost_at(30, 18))
+        self.assertLess(self._cost_at(30, 18), self._cost_at(30, 20))
+
+    def test_touching_is_free(self):
+        self.assertEqual(self._cost_at(30, 14.5), 0.0)
+
+    def test_broken_case_without_the_depth_term_is_flat(self):
+        # the old definition, recomputed by hand: flat 300 inside
+        m = build(start=(30, 20))
+        f = m.footprints[0]
+        x1, y1, x2, y2 = f.bbox
+        k = m.keepouts[0]
+        ox = min(x2, k.xmax) - max(x1, k.xmin)
+        oy = min(y2, k.ymax) - max(y1, k.ymin)
+        self.assertAlmostEqual((ox + oy) * KEEPOUT_WEIGHT / MM, 300.0, places=6)
+        self.assertAlmostEqual(self._cost_at(30, 20), 850.0, places=6)
 
     def test_not_scaled_by_net_count(self):
         a = CostState(build(k=1, start=(30, 20)), quiet=True)._fp_keepout[0]
@@ -288,25 +318,33 @@ class TestGeometricScan(unittest.TestCase):
 
 
 class TestPenaltyBound(unittest.TestCase):
-    """Finding, not a desired behaviour: the term is bounded by (w + h) x 100
-    = 300 mm for P, the HPWL gain grows with the net count (11 mm per net
-    per anchor here). The formula crossover of the two positions (centre vs
-    nearest legal point) is k = 28; the SA already ends inside from k = 23
-    on some seeds (TestEntryBelowTheCrossover) and at k = 40 on every seed.
+    """Finding, not a desired behaviour: the penalty is bounded by the
+    keep-out size, the HPWL gain grows with the net count (11 mm per net per
+    anchor here). P at the centre pays (2 + 1 + 5.5) x 100 = 850 mm, so the
+    formula crossover of the two positions (centre vs nearest legal point)
+    is k = 78 (before the depth term: 300 mm, k = 28). k = 40, which entered
+    on every seed with the old term, now stays out; k = 100 enters.
     Recorded so a change of the term shows up here; see the module doc."""
 
     def test_crossover_from_the_formula(self):
         full = CostState(build(k=1, start=(30, 20)), quiet=True)._fp_keepout[0] / MM
-        self.assertAlmostEqual(full, 300.0, places=6)
-        for k in (27, 28):
+        self.assertAlmostEqual(full, 850.0, places=6)
+        for k in (77, 78):
             h_in = CostState(build(k=k, start=(30, 20)), quiet=True)
             h_out = CostState(build(k=k, start=(30, 14.5)), quiet=True)
             gain = (h_out.hpwl - h_in.hpwl) / MM
             self.assertAlmostEqual(gain, 11.0 * k, places=3)
-            self.assertEqual(gain > full, k == 28)
+            self.assertEqual(gain > full, k == 78)
+
+    def test_k40_now_stays_out(self):
+        m = build(k=40)          # 160 nets, gain 440 < 850 (entered with the old 300)
+        run(m)
+        r = measure(m, [KO])
+        self.assertEqual(r["depth_mm"], 0.0, r)
+        self.assertFalse(r["flagged"], r)
 
     def test_many_nets_enter(self):
-        m = build(k=40)          # 160 nets, gain 440 > 300
+        m = build(k=100)         # 400 nets, gain 1100 > 850
         run(m)
         r = measure(m, [KO])
         self.assertGreater(r["depth_mm"], 0.0, r)
@@ -315,33 +353,40 @@ class TestPenaltyBound(unittest.TestCase):
 
 
 class TestEntryBelowTheCrossover(unittest.TestCase):
-    """Known finding (internal review #2, fix round 2026-11-06), recorded the
-    way TestPenaltyBound records k = 40: at k = 25, below the formula
-    crossover of 28, the SA ends inside the keep-out on part of the seeds
-    (measured 6 of seeds 1-10, 13 of 1-20), each time about 5.5 mm deep at
-    the centre, at a higher full cost than the nearest legal point. It
-    documents a trap of the flat term (no gradient inside), not a desired
-    behaviour; the asserted range lets a seed-level drift pass and fails when
-    the entry disappears (term changed) or becomes general."""
+    """Known finding (internal review #2), recorded the way TestPenaltyBound
+    records the bound. With the old flat term, at k = 25 (below its formula
+    crossover of 28) the SA ended inside the keep-out on 6 of seeds 1-10
+    (13 of 1-20), 5.5 mm deep, at a higher full cost (2050) than the nearest
+    legal point (2025): a trap, no gradient inside. With the depth term
+    (decision 12) k = 25 stays out on all 10 seeds; the residual early entry
+    is now at k = 70 (4 of seeds 1-8) against a crossover of 78, recorded
+    here with a range so seed-level drift passes and a change of the term
+    fails."""
 
-    def test_k25_enters_on_part_of_the_seeds(self):
-        inside = []
+    def test_k25_stays_out_on_every_seed(self):
         for seed in range(1, 11):
             m = build(k=25)
             run(m, seed=seed)
             r = measure(m, [KO])
-            if r["depth_mm"] > 0:
-                inside.append(r)
-                self.assertGreater(r["depth_mm"], 5.0, r)
-                self.assertTrue(r["flagged"], r)
-        self.assertGreaterEqual(len(inside), 4)
-        self.assertLessEqual(len(inside), 8)
+            self.assertEqual(r["depth_mm"], 0.0, (seed, r))
 
     def test_inside_costs_more_than_the_nearest_legal_point(self):
         cin = CostState(build(k=25, start=(30, 20)), quiet=True).total_cost / MM
         cout = CostState(build(k=25, start=(30, 14.5)), quiet=True).total_cost / MM
-        self.assertAlmostEqual(cin, 2050.0, places=3)
+        self.assertAlmostEqual(cin, 2600.0, places=3)        # old term: 2050
         self.assertAlmostEqual(cout, 2025.0, places=3)
+
+    def test_k70_enters_on_part_of_the_seeds(self):
+        inside = 0
+        for seed in range(1, 9):
+            m = build(k=70)
+            run(m, seed=seed)
+            r = measure(m, [KO])
+            if r["depth_mm"] > 0:
+                inside += 1
+                self.assertTrue(r["flagged"], r)
+        self.assertGreaterEqual(inside, 2)
+        self.assertLessEqual(inside, 6)
 
 
 CASES = [
@@ -356,7 +401,8 @@ CASES = [
         anchors={"N": (30, 0.5), "W": (10, 2), "E": (50, 2), "S": (30, 12)}), [(20, 0, 40, 8)]),
     ("F.Cu-only keep-out, back part, k=1", lambda: build(k=1, part_front=False,
                                                          ko_layers="F.Cu"), [KO]),
-    ("bound: k=40 (160 nets)", lambda: build(k=40), [KO]),
+    ("k=40 (160 nets), entered with the old term", lambda: build(k=40), [KO]),
+    ("bound: k=100 (400 nets)", lambda: build(k=100), [KO]),
 ]
 
 

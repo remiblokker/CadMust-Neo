@@ -261,7 +261,9 @@ class TestKeepoutScaling(unittest.TestCase):
         x1, y1, x2, y2 = many.bbox
         ox = min(x2, 70 * MM) - max(x1, 60 * MM)
         oy = min(y2, 40 * MM) - max(y1, 30 * MM)
-        self.assertAlmostEqual(cs._fp_keepout[4], (ox + oy) * KEEPOUT_WEIGHT)
+        # decision 12 (2026-11-06 fix round): plus the intrusion depth
+        depth = min(x2 - 60 * MM, 70 * MM - x1, y2 - 30 * MM, 40 * MM - y1)
+        self.assertAlmostEqual(cs._fp_keepout[4], (ox + oy + depth) * KEEPOUT_WEIGHT)
         self.assertGreaterEqual(KEEPOUT_WEIGHT, OVERLAP_WEIGHT)
 
     def test_penalty_scale_still_applies(self):
