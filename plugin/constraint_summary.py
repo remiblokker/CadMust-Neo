@@ -15,9 +15,9 @@ term (or the snap / lock) did not get what it asked for:
                  cost_function.polygon_edge_limit)      a part past the edge passes
                  antenna_outward lock: the module end   module end within 1 um of
                  (Footprint.edge_anchor_world) to the   the edge, and the antenna
-                 outermost outline point over the       side faces the locked edge
-                 module width (anchor_edge_reference),
-                 plus the antenna direction
+                 outer envelope of the locked edge      side faces the locked edge
+                 (anchor_edge_reference), plus the
+                 antenna direction
     fixed        footprint position vs the file's x/y   error <= 1 um (apply sets it
                  (board-relative, apply_constraints)    exactly, then locks it)
 
@@ -165,11 +165,8 @@ def edge_distance_nm(model, fi: int) -> Optional[float]:
     anc = f.edge_anchor_world()
     ref = {"left": model.outline_xmin, "right": model.outline_xmax,
            "top": model.outline_ymin, "bottom": model.outline_ymax}[edge]
-    line = f.edge_anchor_span_world() if anc is not None else None
-    if line:    # antenna_outward: outermost point over the module's width
-        k = 1 if edge in ("left", "right") else 0
-        ref = anchor_edge_reference(poly, edge, min(line[0][k], line[1][k]),
-                                    max(line[0][k], line[1][k]), ref)
+    if anc is not None:   # antenna_outward: outer envelope of the edge
+        ref = anchor_edge_reference(poly, edge, ref)
     elif poly is not None:
         lo, hi = (y1, y2) if edge in ("left", "right") else (x1, x2)
         lim = polygon_edge_limit(poly, edge, lo, hi)

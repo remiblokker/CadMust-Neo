@@ -298,12 +298,8 @@ def _edge_profile(poly: List[Tuple[int, int]], edge: str):
 
 
 def polygon_edge_limit(poly: List[Tuple[int, int]], edge: str,
-                       lo: int, hi: int, outermost: bool = False) -> Optional[float]:
+                       lo: int, hi: int) -> Optional[float]:
     """Innermost boundary coordinate of the polygon's `edge` side over [lo, hi].
-
-    outermost=True returns the outermost one instead (smallest top-boundary
-    y, largest bottom-boundary y, and so on): the reference for an anchored
-    part's module end (anchor_edge_reference).
 
     edge "top"/"bottom": [lo, hi] is an x-span, the result is a y (largest
     top-boundary y, resp. smallest bottom-boundary y). edge "left"/"right":
@@ -315,8 +311,6 @@ def polygon_edge_limit(poly: List[Tuple[int, int]], edge: str,
     if not bps or hi < bps[0] or lo > bps[-1]:
         return None
     inner_is_max = edge in ("top", "left")
-    if outermost:
-        inner_is_max = not inner_is_max
     best = None
     # intervals overlapping [lo, hi]
     i0 = max(0, bisect.bisect_right(bps, lo) - 1)
@@ -341,28 +335,35 @@ def polygon_edge_limit(poly: List[Tuple[int, int]], edge: str,
 
 
 def anchor_edge_reference(poly: Optional[List[Tuple[int, int]]], edge: str,
-                          lo: int, hi: int, outline_ref: int) -> int:
+                          outline_ref: int) -> int:
     """Edge reference (nm) for the module end of an anchored part (an
-    antenna_outward lock): the outermost outline point along `edge` over
-    [lo, hi], the module's own width (pad-centre extent across the antenna
-    side, Footprint.edge_anchor_span_world), not the courtyard. Without a
-    polygon (rectangular board) the outline bbox edge `outline_ref`.
+    antenna_outward lock): the outer envelope of the locked edge, the
+    outermost outline point along the whole `edge` side (smallest y for
+    "top", largest x for "right", and so on), independent of where the part
+    stands and of its width. Without a polygon (rectangular board) the
+    outline bbox edge `outline_ref`.
 
-    On a notch in the locked edge: a module wider than the notch, or one
-    that reaches past a notch side, gets the outer line, so the module end
-    goes on the outer line and the body spans the notch. That a notch
-    narrower than the module is spanned is the designer's call, not the
-    engine's; the courtyard clip (locked_edge_clip) keeps the innermost
-    reference, so the off-board tests still see the notch. A module whose
-    whole width lies inside the notch only sees the notch floor and goes
-    there. Plain edge locks (no anchor) keep the innermost reference over
-    the bbox span (polygon_edge_limit). Snap (moves.resnap_edges), GUI
-    summary (constraint_summary) and the CadMust-Autopilot checker share
-    this one definition."""
-    if poly is None:
+    A notch anywhere under the antenna is then the antenna window: the
+    module end sits on the outer line and the body spans the notch, whether
+    the notch is narrower or wider than the module, and a part centred over
+    a notch gets the same height as one beside it. On a stepped edge the
+    part also takes the outermost level, wherever it stands. The courtyard
+    clip (locked_edge_clip) keeps the innermost reference, so the off-board
+    tests still see the notch. Plain edge locks (no anchor) keep the
+    innermost reference over the bbox span (polygon_edge_limit). Snap
+    (moves.resnap_edges), GUI summary (constraint_summary) and the
+    CadMust-Autopilot checker share this one definition (decision
+    2026-11-06; it replaces the earlier "outermost over the module's own
+    width", which gave the notch floor to a module narrower than the notch,
+    so the SA slid the module towards a notch side to reach the outer
+    line)."""
+    if not poly:
         return outline_ref
-    lim = polygon_edge_limit(poly, edge, lo, hi, outermost=True)
-    return outline_ref if lim is None else int(round(lim))
+    if edge in ("top", "bottom"):
+        vs = [p[1] for p in poly]
+    else:
+        vs = [p[0] for p in poly]
+    return int(min(vs) if edge in ("top", "left") else max(vs))
 
 
 def locked_edge_clip(fp, bb: Tuple[int, int, int, int],

@@ -104,11 +104,10 @@ def resnap_edges(model: BoardModel, members: List[int]) -> None:
     A part with an edge anchor (an antenna_outward lock,
     Footprint.edge_anchor_world) is snapped by that point instead of its
     bbox: the module end lies exactly on the edge reference (no margin), the
-    courtyard beyond it hangs past the edge. Its edge reference is the
-    outermost outline point over the module's own width
-    (cost_function.anchor_edge_reference; decision 2026-11-06), so on a
-    notch narrower than the module the module end goes on the outer line;
-    without a known width (older pickles) the bbox-span innermost one.
+    courtyard beyond it hangs past the edge. Its edge reference is the outer
+    envelope of the locked edge, the outermost outline point along the whole
+    edge (cost_function.anchor_edge_reference; decision 2026-11-06), so a
+    notch under the antenna is the antenna window whatever its width.
     """
     el = model.edge_locked_indices
     if not el:
@@ -135,12 +134,10 @@ def resnap_edges(model: BoardModel, members: List[int]) -> None:
         fp = fps[x_idx]
         x1, y1, x2, y2 = fp.bbox
         anc = fp.edge_anchor_world() if getattr(fp, "edge_anchor_offset_nm", 0) else None
-        line = fp.edge_anchor_span_world() if anc else None
         if fp.edge_lock == "left":
             ref = model.outline_xmin
-            if line:
-                ref = anchor_edge_reference(poly, "left", min(line[0][1], line[1][1]),
-                                            max(line[0][1], line[1][1]), ref)
+            if anc:
+                ref = anchor_edge_reference(poly, "left", ref)
             elif poly is not None:
                 lim = polygon_edge_limit(poly, "left", y1, y2)
                 if lim is not None:
@@ -148,9 +145,8 @@ def resnap_edges(model: BoardModel, members: List[int]) -> None:
             dx = ref - anc[0] if anc else ref + EDGE_LOCK_MARGIN - x1
         else:
             ref = model.outline_xmax
-            if line:
-                ref = anchor_edge_reference(poly, "right", min(line[0][1], line[1][1]),
-                                            max(line[0][1], line[1][1]), ref)
+            if anc:
+                ref = anchor_edge_reference(poly, "right", ref)
             elif poly is not None:
                 lim = polygon_edge_limit(poly, "right", y1, y2)
                 if lim is not None:
@@ -160,12 +156,10 @@ def resnap_edges(model: BoardModel, members: List[int]) -> None:
         fp = fps[y_idx]
         x1, y1, x2, y2 = fp.bbox
         anc = fp.edge_anchor_world() if getattr(fp, "edge_anchor_offset_nm", 0) else None
-        line = fp.edge_anchor_span_world() if anc else None
         if fp.edge_lock == "top":
             ref = model.outline_ymin
-            if line:
-                ref = anchor_edge_reference(poly, "top", min(line[0][0], line[1][0]) + dx,
-                                            max(line[0][0], line[1][0]) + dx, ref)
+            if anc:
+                ref = anchor_edge_reference(poly, "top", ref)
             elif poly is not None:
                 lim = polygon_edge_limit(poly, "top", x1 + dx, x2 + dx)
                 if lim is not None:
@@ -173,9 +167,8 @@ def resnap_edges(model: BoardModel, members: List[int]) -> None:
             dy = ref - anc[1] if anc else ref + EDGE_LOCK_MARGIN - y1
         else:
             ref = model.outline_ymax
-            if line:
-                ref = anchor_edge_reference(poly, "bottom", min(line[0][0], line[1][0]) + dx,
-                                            max(line[0][0], line[1][0]) + dx, ref)
+            if anc:
+                ref = anchor_edge_reference(poly, "bottom", ref)
             elif poly is not None:
                 lim = polygon_edge_limit(poly, "bottom", x1 + dx, x2 + dx)
                 if lim is not None:

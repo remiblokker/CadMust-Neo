@@ -218,13 +218,15 @@ class TestGreedyKeepsAngle(unittest.TestCase):
 
 
 class TestNotchOnTheLockedEdge(unittest.TestCase):
-    """Decision 2026-11-06: an anchored part's edge reference is the
-    outermost outline point over the module's own width (the pad-centre
-    extent across the antenna side, 17.2 mm here; the courtyard is 19.6 mm),
-    the courtyard clip keeps the innermost one, plain locks are unchanged.
-    Broken case: with the old reference (innermost over the courtyard span)
-    the straddling and the wider cases put the module end on the notch
-    floor (6 mm) and fail."""
+    """Decision 2026-11-06: an anchored part's edge reference is the outer
+    envelope of the locked edge (the outermost outline point along the whole
+    edge), independent of where the part stands and of its width (pad-centre
+    extent 17.2 mm here, courtyard 19.6 mm). The courtyard clip keeps the
+    innermost reference, plain locks are unchanged. Broken case: the earlier
+    "outermost over the module's width" rule put a module wholly over a
+    notch wider than itself on the notch floor (6 mm): on that rule four of
+    these tests fail (inside a wider notch, wherever it stands, stepped
+    edge, left-edge notch)."""
 
     D = 6 * MM   # notch depth
 
@@ -233,51 +235,65 @@ class TestNotchOnTheLockedEdge(unittest.TestCase):
         return [(0, 0), (a * MM, 0), (a * MM, d), (b * MM, d), (b * MM, 0),
                 (BW, 0), (BW, BH), (0, BH)]
 
-    def _top(self, x, a=30, b=50):
+    def _top(self, x, a=30, b=50, poly=None):
         u3 = module_fp(x=x * MM, y=37 * MM, angle=0.0)
         m = board(u3)
-        m.outline_polygon = self._top_poly(a, b)
+        m.outline_polygon = poly if poly is not None else self._top_poly(a, b)
         apply_constraints(m, cset("top"), log=None)
         f = m.footprints[0]
         f.x = x * MM
         resnap_edges(m, [0])
         return m, f
 
-    def test_width_is_the_pad_extent_not_the_courtyard(self):
-        m, f = self._top(40)
-        self.assertEqual(f.edge_anchor_span_nm, (int(-8.6 * MM), int(8.6 * MM)))
-        line = f.edge_anchor_span_world()
-        self.assertEqual(sorted((line[0][0], line[1][0])),
-                         [int(31.4 * MM), int(48.6 * MM)])
+    def _assert_outer(self, f, msg=None):
+        self.assertLessEqual(abs(f.edge_anchor_world()[1]), 2, msg)
 
-    def test_narrower_module_straddling_a_notch_side_goes_on_the_outer_line(self):
-        # module x 23.4 .. 40.6 over a notch at x 30 .. 50
-        m, f = self._top(32)
-        self.assertLessEqual(abs(f.edge_anchor_world()[1]), 2)
-
-    def test_narrower_module_inside_the_notch_goes_on_the_floor(self):
-        # module x 31.4 .. 48.6 entirely over the notch floor
+    def test_module_inside_a_wider_notch_goes_on_the_outer_line(self):
+        # module x 31.4 .. 48.6 wholly over a notch at x 30 .. 50: the notch
+        # is the antenna window, the module end on the outer line, not on
+        # the floor at 6 mm
         m, f = self._top(40)
-        self.assertLessEqual(abs(f.edge_anchor_world()[1] - self.D), 2)
+        self._assert_outer(f)
+        self.assertNotAlmostEqual(f.edge_anchor_world()[1], self.D, delta=2)
+
+    def test_same_height_wherever_the_module_stands(self):
+        # centred over the notch, straddling a notch side, beside it
+        for x in (40, 32, 60):
+            m, f = self._top(x)
+            self._assert_outer(f, x)
 
     def test_wider_module_spans_the_notch(self):
         # notch x 34 .. 46 (12 mm) narrower than the 17.2 mm module width
         m, f = self._top(40, a=34, b=46)
-        self.assertLessEqual(abs(f.edge_anchor_world()[1]), 2)
+        self._assert_outer(f)
         # the courtyard clip still uses the innermost reference (notch
         # floor): a bbox reaching 5 mm past the outer line is cut at 6 mm
         from plugin.moves import _boundary_bbox
         x1, _y1, x2, y2 = f.bbox
         self.assertEqual(_boundary_bbox(m, f, (x1, -5 * MM, x2, y2))[1], self.D)
-        # the GUI summary measures the module end the same way
+
+    def test_gui_summary_measures_the_outer_line(self):
         from plugin.constraint_summary import edge_distance_nm
-        self.assertLessEqual(abs(edge_distance_nm(m, 0)), 2)
+        for a, b in ((34, 46), (30, 50)):
+            m, f = self._top(40, a=a, b=b)
+            self.assertLessEqual(abs(edge_distance_nm(m, 0)), 2, (a, b))
+            # broken case: the module end on the notch floor reads 6 mm
+            f.y += self.D
+            self.assertAlmostEqual(edge_distance_nm(m, 0), self.D, delta=2)
+
+    def test_stepped_edge_takes_the_outermost_level(self):
+        # top edge at y 0 for x < 20, y 6 mm beyond: a part at x 50 stands
+        # only over the lower level and still gets the outer line
+        d = self.D
+        poly = [(0, 0), (20 * MM, 0), (20 * MM, d), (BW, d), (BW, BH), (0, BH)]
+        m, f = self._top(50, poly=poly)
+        self._assert_outer(f)
 
     def test_left_edge_notch(self):
         d = self.D
         poly = [(0, 0), (BW, 0), (BW, BH), (0, BH), (0, 50 * MM), (d, 50 * MM),
                 (d, 30 * MM), (0, 30 * MM)]
-        for y, want in ((32, 0), (40, d)):
+        for y in (32, 40):
             u3 = module_fp(x=37 * MM, y=y * MM, angle=0.0)
             m = board(u3)
             m.outline_polygon = poly
@@ -285,7 +301,7 @@ class TestNotchOnTheLockedEdge(unittest.TestCase):
             f = m.footprints[0]
             f.y = y * MM
             resnap_edges(m, [0])
-            self.assertLessEqual(abs(f.edge_anchor_world()[0] - want), 2, y)
+            self.assertLessEqual(abs(f.edge_anchor_world()[0]), 2, y)
 
     def test_plain_lock_keeps_the_innermost_reference(self):
         u3 = module_fp(x=40 * MM, y=37 * MM, angle=0.0)
@@ -294,26 +310,8 @@ class TestNotchOnTheLockedEdge(unittest.TestCase):
         apply_constraints(m, cset("top", outward=None), log=None)
         f = m.footprints[0]
         resnap_edges(m, [0])
-        self.assertIsNone(f.edge_anchor_span_world())
+        self.assertIsNone(f.edge_anchor_world())
         self.assertEqual(f.bbox[1], self.D + EDGE_LOCK_MARGIN)
-
-    def test_old_pickle_without_width_uses_the_bbox_span(self):
-        m, f = self._top(40, a=34, b=46)
-        del f.edge_anchor_span_nm          # instance attr gone: class default None
-        resnap_edges(m, [0])
-        self.assertLessEqual(abs(f.edge_anchor_world()[1] - self.D), 2)
-
-    def test_flip_mirrors_an_x_side_width(self):
-        f = module_fp(x=0, y=0)
-        f.antenna_side, f.edge_anchor_offset_nm = "+x", 5 * MM
-        f.edge_anchor_span_nm = (-2 * MM, 3 * MM)
-        f.flip_side()
-        self.assertEqual(f.edge_anchor_span_nm, (-3 * MM, 2 * MM))
-        g = module_fp(x=0, y=0)
-        g.antenna_side, g.edge_anchor_offset_nm = "-y", 5 * MM
-        g.edge_anchor_span_nm = (-2 * MM, 3 * MM)
-        g.flip_side()
-        self.assertEqual(g.edge_anchor_span_nm, (-2 * MM, 3 * MM))
 
 
 class TestGreedyKeepsPlainEdgeLockAngle(unittest.TestCase):
