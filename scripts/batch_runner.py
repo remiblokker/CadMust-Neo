@@ -279,6 +279,8 @@ def apply_overrides(config: SAConfig, args) -> SAConfig:
         config.zone_weight = args.zone_weight
     if getattr(args, "offboard", None) is not None:
         config.offboard = args.offboard
+    if getattr(args, "pad_clearance", None) is not None:
+        config.pad_clearance = args.pad_clearance == "on"
     return config
 
 
@@ -382,6 +384,7 @@ def run_single_model(args, cset) -> int:
         res["unlocked_refs"] = unlocked_refs
         # SAResult.total_moves over wall time (incl. greedy); the profile log's
         # Moves/sec sums cumulative per-phase counts and reads higher
+        res["pad_clearance"] = config.pad_clearance
         res["moves_per_s_wall"] = round(result.total_moves / elapsed) if elapsed > 0 else None
         res["constraint_report"] = report.counts() if report is not None else None
         res["constraint_skipped_items"] = (report.as_dict()["skipped_items"]
@@ -447,6 +450,10 @@ def main():
     parser.add_argument("--offboard", choices=("clamp", "reject"), default=None,
                         help="Moves that would leave the outline bbox: reject them "
                              "(default) or clamp them onto the edge")
+    parser.add_argument("--pad-clearance", choices=("on", "off"), default=None,
+                        help="Pad-level clearance term (pads of different footprints "
+                             "closer than their local clearance cost like an overlap); "
+                             "default: the SAConfig default")
     args = parser.parse_args()
 
     if args.unlock == "constrained" and not args.constraints:

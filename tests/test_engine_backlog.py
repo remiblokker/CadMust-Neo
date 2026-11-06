@@ -293,5 +293,126 @@ class TestKeepoutScaling(unittest.TestCase):
         self.assertAlmostEqual(inc, cs._keepout_penalty, places=3)
 
 
+# ---------------------------------------------------------------------------
+# 4. Pad-level clearance
+# ---------------------------------------------------------------------------
+
+from plugin.board_model import BoardModel, Net  # noqa: E402
+from plugin.moves import do_rotate  # noqa: E402
+
+
+def _pad_model(clearance=2_540_000, side_b="F", net_b=2, gap=1_000_000):
+    """Two 4 x 4 mm parts side by side, courtyards gap apart. A has one
+    2 x 2 mm pad at its right edge (clearance on it), B one at its left edge."""
+    def part(ref, idx, x, pad_x, side, clr, net):
+        pad = Pad(net_code=net, net_name="N%d" % net, offset_x=pad_x, offset_y=0)
+        pad.rect = (pad_x - MM, -MM, pad_x + MM, MM)
+        pad.side = side
+        pad.clearance = clr
+        return Footprint(reference=ref, index=idx, x=x, y=20 * MM, angle_deg=0.0,
+                         width=4 * MM, height=4 * MM, locked=False, pads=[pad],
+                         net_codes={net})
+    a = part("RLY", 0, 20 * MM, MM, "TH", clearance, 1)
+    b = part("R1", 1, 24 * MM + gap, -MM, side_b, 0, net_b)
+    nets = {1: Net(1, "N1", [(0, 0)]), net_b: Net(net_b, "N%d" % net_b, [(1, 0)])}
+    return BoardModel(footprints=[a, b], nets=nets, outline_xmin=0, outline_ymin=0,
+                      outline_xmax=60 * MM, outline_ymax=40 * MM, moveable_indices=[0, 1])
+
+
+class TestPadClearance(unittest.TestCase):
+    def test_off_by_default_and_without_data(self):
+        m = _pad_model()
+        self.assertEqual(CostState(copy.deepcopy(m), quiet=True)._overlap_penalty, 0.0)
+        self.assertFalse(SAConfig().pad_clearance)
+        # pads without copper data (older pickles): no term even when on
+        for f in m.footprints:
+            for p in f.pads:
+                p.rect = None
+        self.assertEqual(CostState(m, quiet=True, pad_clearance=True)._overlap_penalty, 0.0)
+
+    def test_clearance_violation_beyond_courtyard(self):
+        m = _pad_model()
+        cs = CostState(m, quiet=True, pad_clearance=True)
+        # pad gap = 1 mm + 0 + 0 = courtyard gap 1 mm (pads at the edges);
+        # required 2.54 -> ox = 1.54 mm, oy = 2 mm (pad heights, clearance
+        # widens A to 7.08 mm tall, B is 2 mm)
+        self.assertAlmostEqual(cs._overlap_penalty, (1_540_000 + 2 * MM) * 50.0)
+        self.assertIn(0, cs._ext_fps)        # reach beyond the bbox
+
+    def test_same_net_and_opposite_side_skipped(self):
+        m = _pad_model(net_b=1)
+        self.assertEqual(CostState(m, quiet=True, pad_clearance=True)._overlap_penalty, 0.0)
+        # TH pad against a back-side SMD pad still counts; front SMD vs back SMD not
+        m = _pad_model(side_b="B")
+        self.assertGreater(CostState(m, quiet=True, pad_clearance=True)._overlap_penalty, 0)
+        m = _pad_model(side_b="B")
+        m.footprints[0].pads[0].side = "F"
+        self.assertEqual(CostState(m, quiet=True, pad_clearance=True)._overlap_penalty, 0.0)
+
+    def test_no_double_count_with_courtyard_overlap(self):
+        m = _pad_model(clearance=0, gap=-1_500_000)   # courtyards overlap 1.5 mm
+        off = CostState(copy.deepcopy(m), quiet=True)._overlap_penalty
+        on = CostState(m, quiet=True, pad_clearance=True)._overlap_penalty
+        self.assertGreater(off, 0)
+        # pads overlap 1.5 mm in x and 2 mm in y < courtyard 1.5 + 4 mm: max keeps it
+        self.assertEqual(on, off)
+
+    def test_same_group_exempt(self):
+        from plugin.board_model import ComponentGroup
+        m = _pad_model()
+        m.component_groups = [ComponentGroup(member_indices=[0, 1])]
+        m.fp_to_group = {0: 0, 1: 0}
+        self.assertEqual(CostState(m, quiet=True, pad_clearance=True)._overlap_penalty, 0.0)
+
+    def test_rotation_and_flip_keep_geometry(self):
+        m = _pad_model()
+        fp = m.footprints[0]
+        fp.set_angle(90.0)
+        w = CostState(m, quiet=True, pad_clearance=True)._pads_world(0)[0]
+        # local pad rect x in [0, 2] mm, y in [-1, 1]; at 90 deg (KiCad CW,
+        # y down) local +x maps to world -y
+        self.assertEqual((w[0], w[1], w[2], w[3]),
+                         (fp.x - MM, fp.y - 2 * MM, fp.x + MM, fp.y))
+        b = m.footprints[1]
+        b.pads[0].rect = (-2 * MM, -MM, 0, 500_000)
+        b.flip_side()
+        self.assertEqual(b.pads[0].rect, (-2 * MM, -500_000, 0, MM))
+        self.assertEqual(b.pads[0].side, "B")
+
+    def test_incremental_matches_full(self):
+        rnd = random.Random(11)
+        m = make_model(n=10)
+        for f in m.footprints:
+            for p in f.pads:
+                p.rect = (p.offset_x - 600_000, -600_000, p.offset_x + 600_000, 600_000)
+                p.side = rnd.choice(["F", "TH"])
+                p.clearance = rnd.choice([0, 0, 2_540_000])
+        cs = CostState(m, quiet=True, pad_clearance=True)
+        random.seed(11)
+        for k in range(400):
+            undo = do_translate(m, 0.5, 15 * MM) if k % 4 else do_rotate(m)
+            cs.incremental_update(affected_indices(undo))
+            if rnd.random() < 0.5:
+                revert_move(m, undo)
+                cs.incremental_update(affected_indices(undo))
+        inc = cs._overlap_penalty
+        cs._compute_all()
+        self.assertAlmostEqual(inc, cs._overlap_penalty, places=2)
+
+    def test_cli_flag(self):
+        tmp = tempfile.mkdtemp()
+        pkl = os.path.join(tmp, "b.pkl")
+        with open(pkl, "wb") as f:
+            pickle.dump(_pad_model(), f)
+        for flag, want in (("on", True), ("off", False)):
+            rj = os.path.join(tmp, "r%s.json" % flag)
+            p = subprocess.run([sys.executable, SCRIPT, "--model", pkl, "--profile", "quick",
+                                "--seed", "1", "--pad-clearance", flag, "--result-json", rj],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            with open(rj) as f:
+                self.assertEqual(json.load(f)["pad_clearance"], want)
+
+
 if __name__ == "__main__":
     unittest.main()

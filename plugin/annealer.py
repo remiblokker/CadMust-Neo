@@ -63,6 +63,12 @@ class SAConfig:
     # off-board proposal exactly on the edge.
     offboard: str = "reject"
 
+    # Pad-level clearance term (docs/PAD_CLEARANCE_DESIGN.md): copper pads of
+    # different footprints closer than their local clearance (or touching)
+    # cost like a courtyard overlap of the same depth. Needs pad copper data
+    # (models extracted from 2026-11-06 on); older pickles are unaffected.
+    pad_clearance: bool = False
+
 
 @dataclass
 class SAResult:
@@ -605,7 +611,8 @@ def run_sa(
                            congestion_weight=config.congestion_weight,
                            congestion_bin_size=config.congestion_bin_size,
                            cohesion_weight=config.cohesion_weight,
-                           zone_weight=config.zone_weight)
+                           zone_weight=config.zone_weight,
+                           pad_clearance=config.pad_clearance)
     initial_cost = cost_state.total_cost
 
     # Global best across all starts — initialised to +inf so the first start
@@ -642,7 +649,8 @@ def run_sa(
                                congestion_weight=config.congestion_weight,
                                congestion_bin_size=config.congestion_bin_size,
                                cohesion_weight=config.cohesion_weight,
-                               zone_weight=config.zone_weight)
+                               zone_weight=config.zone_weight,
+                               pad_clearance=config.pad_clearance)
         start_hpwls.append(int(cost_state.hpwl))
 
         # Calibrate T0 for this starting placement

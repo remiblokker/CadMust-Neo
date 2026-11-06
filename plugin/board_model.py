@@ -71,6 +71,15 @@ class Pad:
     net_name: str
     offset_x: int              # pad offset from footprint center at 0° rotation (nm)
     offset_y: int
+    # Copper geometry for the pad-level clearance term (2026-11-06). Plain
+    # defaults are class attributes, so older pickles read "no data".
+    # rect: local bbox at 0 degrees relative to the fp origin (nm), the
+    # th_rects convention; side: "F", "B", "TH" (both sides) or "" (no
+    # outer copper); clearance: pad local clearance, else the footprint's,
+    # else 0 (nm).
+    rect: Optional[Tuple[int, int, int, int]] = None
+    side: str = ""
+    clearance: int = 0
 
     def abs_position(self, fp_x: int, fp_y: int, angle_deg: float) -> Tuple[int, int]:
         """Compute absolute pad position given footprint center and rotation.
@@ -236,6 +245,12 @@ class Footprint:
             return (r[0], -r[3], r[2], -r[1])
         for pad in self.pads:
             pad.offset_y = -pad.offset_y
+            r = getattr(pad, 'rect', None)
+            if r is not None:
+                pad.rect = my(r)
+            ps = getattr(pad, 'side', "")
+            if ps in ("F", "B"):
+                pad.side = "B" if ps == "F" else "F"
         self.cy_offset = -self.cy_offset
         self.th_rects = [my(r) for r in (getattr(self, 'th_rects', None) or [])]
         ko = getattr(self, 'keepout_rects', ())
@@ -317,6 +332,46 @@ class BoardModel:
     soft_groups: Optional[List[Tuple[str, List[int], int]]] = None
     # Zone preferences: fp_index -> preferred zone rect (xmin, ymin, xmax, ymax) in nm.
     zone_prefs: Optional[Dict[int, Tuple[float, float, float, float]]] = None
+
+
+def _opt_nm(v) -> int:
+    """KiCad 9+ returns std::optional<int> (None or int), older an int."""
+    try:
+        return max(0, int(v)) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pad_copper(pad, pos, cos_a, sin_a, has_hole, fp_clearance):
+    """(rect, side, clearance) of one pad for the pad-clearance term.
+
+    rect: the pad's world bbox (pad.GetBoundingBox, rotation included)
+    un-rotated into the footprint frame at 0 degrees, as a bbox; exact for
+    parts at multiples of 90 degrees.
+    """
+    import pcbnew as pcbnew_mod
+    bb = pad.GetBoundingBox()
+    xs, ys = [], []
+    for wx, wy in ((bb.GetLeft(), bb.GetTop()), (bb.GetRight(), bb.GetTop()),
+                   (bb.GetRight(), bb.GetBottom()), (bb.GetLeft(), bb.GetBottom())):
+        dx = wx - pos.x
+        dy = wy - pos.y
+        xs.append(dx * cos_a - dy * sin_a)
+        ys.append(dx * sin_a + dy * cos_a)
+    rect = (int(round(min(xs))), int(round(min(ys))),
+            int(round(max(xs))), int(round(max(ys))))
+    if has_hole:
+        side = "TH"
+    elif pad.IsOnLayer(pcbnew_mod.F_Cu):
+        side = "F"
+    elif pad.IsOnLayer(pcbnew_mod.B_Cu):
+        side = "B"
+    else:
+        side = ""
+    clr = _opt_nm(pad.GetLocalClearance())
+    if not clr:
+        clr = fp_clearance
+    return rect, side, clr
 
 
 def _rule_area_forbids_footprints(zone) -> bool:
@@ -606,6 +661,7 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
         cos_a = math.cos(rad)
         sin_a = math.sin(rad)
 
+        fp_clearance = _opt_nm(getattr(fp, "GetLocalClearance", lambda: None)())
         for j, pad in enumerate(fp.Pads()):
             pad_pos = pad.GetPosition()
             nc = pad.GetNetCode()
@@ -654,6 +710,11 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
                 offset_x=offset_x,
                 offset_y=offset_y,
             )
+            try:
+                p.rect, p.side, p.clearance = _pad_copper(
+                    pad, pos, cos_a, sin_a, has_hole, fp_clearance)
+            except Exception:
+                pass   # no copper data: the pad-clearance term skips the pad
             pads_list.append(p)
 
             if nc > 0:
