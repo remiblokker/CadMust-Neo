@@ -34,15 +34,31 @@ Definitions (nm, world frame, KiCad y down):
   BOTH sides of the module along the edge (the edge comes back out on the
   left and on the right): a window. Inward on one side only = a step.
 
+* envelope offset: |module end - outer envelope| on the edge normal. The
+  engine snaps an antenna_outward module end onto the envelope exactly; a
+  hand-placed board (the checker also runs on designer boards) may not.
+  window and material need the offset within ENVELOPE_TOL_NM (the engine's
+  edge-lock snap distance, moves.EDGE_LOCK_MARGIN, 1.0 mm); otherwise the
+  class is off_envelope (internal review #1, 2026-11-06: a module 2.8 mm
+  past the outline over a notch read as a window).
+* outline: the single outer contour of the board (board_model stores
+  poly_set.Outline(0) only); holes and cut-outs inside it are not
+  represented. When the extracted model counts holes (outline_hole_count >
+  0) the material fraction cannot be trusted and the class is unknown.
+
 Classification, in this order:
 
-    no_strip   strip has zero area                      warn
-    mixed      0 < material fraction < 1                warn
-    stepped    more than one level under the module    warn
-    material   strip wholly over board material         pass
-    window     strip wholly over void in a notch        pass
-    overhang   strip wholly over void, no notch         warn
-               (past a lower step or past the outline)
+    no_strip      strip has zero area                      warn
+    unknown       the outline has holes (not represented)  warn
+    mixed         0 < material fraction < 1                warn
+    stepped       more than one level under the module    warn
+    off_envelope  wholly over material or wholly over void warn
+                  in a notch, but the module end is more
+                  than ENVELOPE_TOL_NM off the envelope
+    material      strip wholly over board material         pass
+    window        strip wholly over void in a notch        pass
+    overhang      strip wholly over void, no notch         warn
+                  (past a lower step or past the outline)
 
 Shared by plugin.constraint_summary (GUI results) and the
 CadMust-Autopilot checker (record keepout.<ref>.antenna_window).
@@ -55,14 +71,22 @@ from typing import List, Optional, Tuple
 
 from .constraints import MM, _axis_sign, _from_outward
 from .cost_function import anchor_edge_reference, _edge_profile
+from .moves import EDGE_LOCK_MARGIN
 
 # area fractions within this of 0 or 1 count as wholly void / material
 FRACTION_TOL = 1e-3
 # two outline levels closer than this are one level (10 um)
 LEVEL_TOL_NM = 10_000
+# module end vs outer envelope: window/material only within this (the
+# engine's edge-lock snap distance; the checker uses the same number, it
+# calls this function)
+ENVELOPE_TOL_NM = EDGE_LOCK_MARGIN
+
+SINGLE_CONTOUR_NOTE = "single outer contour, holes not represented"
 
 CLASS_STATUS = {"no_strip": "warn", "mixed": "warn", "stepped": "warn",
-                "material": "pass", "window": "pass", "overhang": "warn"}
+                "material": "pass", "window": "pass", "overhang": "warn",
+                "off_envelope": "warn", "unknown": "warn"}
 
 CLASS_TEXT = {
     "no_strip": "no antenna strip to measure",
@@ -72,6 +96,8 @@ CLASS_TEXT = {
     "window": "antenna window: strip wholly over void in a notch",
     "overhang": "strip wholly over void without a notch around it "
                 "(past a lower step of the edge or past the outline)",
+    "off_envelope": "module end off the outer envelope of the locked edge",
+    "unknown": "outline has holes the model does not represent; strip not classified",
 }
 
 
@@ -90,6 +116,8 @@ class AntennaWindow:
     levels_nm: List[float] = field(default_factory=list)   # outline levels under the strip width
     stepped: bool = False
     notch: Optional[bool] = None                # None unless a single inward level
+    envelope_offset_nm: float = 0.0             # |module end - envelope|
+    hole_count: int = 0                         # outline holes in the model (not represented)
 
     @property
     def void_fraction(self) -> float:
@@ -97,6 +125,12 @@ class AntennaWindow:
 
     @property
     def text(self) -> str:
+        if self.classification == "off_envelope":
+            return "%s by %.2f mm (tolerance %.2f mm)" % (
+                CLASS_TEXT["off_envelope"], self.envelope_offset_nm / MM, ENVELOPE_TOL_NM / MM)
+        if self.classification == "unknown":
+            return "outline has %d hole(s), not represented; strip not classified" \
+                % self.hole_count
         return CLASS_TEXT[self.classification]
 
 
@@ -187,11 +221,13 @@ def _levels(poly, edge, lo, hi):
     return distinct, before, after
 
 
-def antenna_window(fp, res, edge: str, poly, outline) -> AntennaWindow:
+def antenna_window(fp, res, edge: str, poly, outline, holes: int = 0) -> AntennaWindow:
     """Measure the antenna strip of footprint fp (final position) against the
     outline. res: the AntennaResolution of its antenna item; edge: the locked
     edge; poly: the outline polygon, or None for a rectangular board;
-    outline: (xmin, ymin, xmax, ymax) of the outline bbox."""
+    outline: (xmin, ymin, xmax, ymax) of the outline bbox; holes: the number
+    of holes in the board outline (BoardModel.outline_hole_count), which the
+    polygon does not carry."""
     axis, sign = _axis_sign(res.side)
     strip_local = res.strip
     source = "depth_mm"
@@ -231,16 +267,21 @@ def antenna_window(fp, res, edge: str, poly, outline) -> AntennaWindow:
             (lambda v: v is not None and v > lev + LEVEL_TOL_NM)
         notch = inward(before) and inward(after)
 
+    offset = abs(float(module_end) - float(envelope))
+    on_envelope = offset <= ENVELOPE_TOL_NM
+    holes = int(holes or 0)
     if area <= 0:
         cls = "no_strip"
+    elif holes > 0:
+        cls = "unknown"
     elif FRACTION_TOL < frac < 1.0 - FRACTION_TOL:
         cls = "mixed"
     elif stepped:
         cls = "stepped"
     elif frac >= 1.0 - FRACTION_TOL:
-        cls = "material"
+        cls = "material" if on_envelope else "off_envelope"
     elif notch:
-        cls = "window"
+        cls = "window" if on_envelope else "off_envelope"
     else:
         cls = "overhang"
     return AntennaWindow(ref=fp.reference, edge=edge, classification=cls,
@@ -248,7 +289,8 @@ def antenna_window(fp, res, edge: str, poly, outline) -> AntennaWindow:
                          envelope_nm=float(envelope), strip_world=sw,
                          strip_source=source, strip_area_mm2=area / (MM * MM),
                          material_fraction=frac, levels_nm=levels,
-                         stepped=stepped, notch=notch)
+                         stepped=stepped, notch=notch, envelope_offset_nm=offset,
+                         hole_count=holes)
 
 
 def summary_line(w: AntennaWindow) -> str:

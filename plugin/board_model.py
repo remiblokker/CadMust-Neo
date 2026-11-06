@@ -363,6 +363,10 @@ class BoardModel:
     soft_groups: Optional[List[Tuple[str, List[int], int]]] = None
     # Zone preferences: fp_index -> preferred zone rect (xmin, ymin, xmax, ymax) in nm.
     zone_prefs: Optional[Dict[int, Tuple[float, float, float, float]]] = None
+    # holes (cut-outs) in the outer contour: counted at extraction, not
+    # represented in outline_polygon (single outer contour); 0 = none or an
+    # old pickle (class attribute default)
+    outline_hole_count: int = 0
 
 
 def _opt_nm(v) -> int:
@@ -909,6 +913,7 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
 
     # Extract board outline polygon for non-rectangular boards
     outline_polygon: Optional[List[Tuple[int, int]]] = None
+    outline_hole_count = 0
     try:
         import pcbnew as _pcbnew
         poly_set = _pcbnew.SHAPE_POLY_SET()
@@ -925,6 +930,10 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
                 pts.append((pt.x, pt.y))
             if len(pts) >= 3:
                 outline_polygon = pts
+            try:
+                outline_hole_count = int(poly_set.HoleCount(0))
+            except Exception:
+                outline_hole_count = 0
     except Exception:
         pass  # polygon extraction not available; rectangular bbox used
 
@@ -955,6 +964,7 @@ def extract_board_model(board, selected_only: bool = False) -> BoardModel:
         keepouts=keepouts,
         moveable_indices=moveable,
         outline_polygon=outline_polygon,
+        outline_hole_count=outline_hole_count,
         component_groups=component_groups,
         fp_to_group=fp_to_group,
     )

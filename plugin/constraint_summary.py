@@ -262,7 +262,8 @@ def measure_antenna_windows(model, cset) -> list:
             res = resolve_antenna_item(f, items[f.reference])
         except AntennaError:
             continue
-        out.append(antenna_window(f, res, f.edge_lock, poly, outline))
+        out.append(antenna_window(f, res, f.edge_lock, poly, outline,
+                                  holes=getattr(model, "outline_hole_count", 0)))
     return out
 
 

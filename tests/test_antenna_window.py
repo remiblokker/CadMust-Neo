@@ -18,7 +18,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from plugin.constraints import apply_constraints, resolve_antenna_item  # noqa: E402
 from plugin.moves import resnap_edges, _edge_snap_polygon  # noqa: E402
-from plugin.antenna_window import antenna_window, material_fraction, summary_line  # noqa: E402
+from plugin.antenna_window import (antenna_window, material_fraction, summary_line,  # noqa: E402
+                                   ENVELOPE_TOL_NM, SINGLE_CONTOUR_NOTE)
+from plugin.moves import EDGE_LOCK_MARGIN  # noqa: E402
 
 from test_antenna_keepout import module_fp  # noqa: E402
 from test_antenna_outward import board, cset, BW, BH  # noqa: E402
@@ -38,6 +40,28 @@ def stepped_top():
             (30 * MM, 10 * MM), (BW, 10 * MM), (BW, BH), (0, BH)]
 
 
+def bottom_notch(a, b, d):
+    """Bottom edge with one notch from x=a to x=b, d mm deep."""
+    return [(0, 0), (BW, 0), (BW, BH), (b * MM, BH), (b * MM, BH - d * MM),
+            (a * MM, BH - d * MM), (a * MM, BH), (0, BH)]
+
+
+def right_notch(a, b, d):
+    """Right edge with one notch from y=a to y=b, d mm deep."""
+    return [(0, 0), (BW, 0), (BW, a * MM), (BW - d * MM, a * MM), (BW - d * MM, b * MM),
+            (BW, b * MM), (BW, BH), (0, BH)]
+
+
+def remeasure(m, f, edge, holes=0):
+    """antenna_window of f where it is now (no snap)."""
+    ko = None
+    for it in m._cset.placement["keep_out_zones"]:
+        ko = it
+    res = resolve_antenna_item(f, ko)
+    outline = (m.outline_xmin, m.outline_ymin, m.outline_xmax, m.outline_ymax)
+    return antenna_window(f, res, edge, _edge_snap_polygon(m), outline, holes=holes)
+
+
 def place(x, poly, depth=6.0, back=False, edge="top"):
     u = module_fp(x=x * MM, y=37 * MM, angle=180.0 if back else 0.0)
     if back:
@@ -51,6 +75,7 @@ def place(x, poly, depth=6.0, back=False, edge="top"):
     else:
         ko["antenna"]["depth_mm"] = depth
     apply_constraints(m, c, log=None)
+    m._cset = c
     f = m.footprints[0]
     if edge in ("top", "bottom"):
         f.x = x * MM
@@ -145,6 +170,91 @@ class TestClassification(unittest.TestCase):
         self.assertAlmostEqual(w.strip_area_mm2, 17.2 * 7.49, places=2)
         self.assertEqual(w.classification, "window")
 
+
+class TestFourEdges(unittest.TestCase):
+    """Bottom and right edge (internal review #6): inverting the bottom/right
+    branch of the notch rule turns these windows into overhangs."""
+
+    def test_bottom_edge_window_and_mixed(self):
+        _m, _f, w = place(40, bottom_notch(30, 50, 8), edge="bottom")
+        self.assertEqual(w.classification, "window")
+        self.assertTrue(w.notch)
+        self.assertAlmostEqual(w.material_fraction, 0.0, places=6)
+        _m, _f, w = place(32, bottom_notch(30, 50, 8), edge="bottom")
+        self.assertEqual(w.classification, "mixed")
+        self.assertAlmostEqual(w.material_fraction, 6.6 / 17.2, places=3)
+
+    def test_right_edge_window_and_mixed(self):
+        _m, _f, w = place(40, right_notch(30, 50, 8), edge="right")
+        self.assertEqual(w.classification, "window")
+        self.assertTrue(w.notch)
+        self.assertAlmostEqual(w.material_fraction, 0.0, places=6)
+        _m, _f, w = place(32, right_notch(30, 50, 8), edge="right")
+        self.assertEqual(w.classification, "mixed")
+        self.assertAlmostEqual(w.material_fraction, 6.6 / 17.2, places=3)
+
+
+class TestOffEnvelope(unittest.TestCase):
+    """window and material need the module end within ENVELOPE_TOL_NM of the
+    outer envelope (internal review #1: a module 2.8 or 7.8 mm past the
+    outline over a notch read as an antenna window)."""
+
+    def test_tolerance_is_the_engine_snap_distance(self):
+        self.assertEqual(ENVELOPE_TOL_NM, EDGE_LOCK_MARGIN)
+
+    def test_window_geometry_off_the_board(self):
+        m, f, w = place(40, top_notch(30, 50, 8))
+        self.assertEqual(w.classification, "window")            # snapped
+        for off in (2.8, 7.8):
+            f.y -= int(off * MM)
+            w = remeasure(m, f, "top")
+            f.y += int(off * MM)
+            self.assertAlmostEqual(w.material_fraction, 0.0, places=6)
+            self.assertEqual(w.classification, "off_envelope", off)
+            self.assertEqual(w.status, "warn")
+            self.assertAlmostEqual(w.envelope_offset_nm / MM, off, places=3)
+            self.assertIn("by %.2f mm" % off, summary_line(w))
+
+    def test_material_geometry_inside_the_board(self):
+        m, f, w = place(40, None)
+        self.assertEqual(w.classification, "material")
+        f.y += int(2.8 * MM)          # module end 2.8 mm inside the board
+        self.assertEqual(remeasure(m, f, "top").classification, "off_envelope")
+        f.y -= int(2.3 * MM)          # 0.5 mm inside: within the tolerance
+        self.assertEqual(remeasure(m, f, "top").classification, "material")
+
+    def test_right_edge_off_envelope(self):
+        m, f, w = place(40, right_notch(30, 50, 8), edge="right")
+        self.assertEqual(w.classification, "window")
+        f.x += int(2.8 * MM)
+        self.assertEqual(remeasure(m, f, "right").classification, "off_envelope")
+
+
+class TestOutlineHoles(unittest.TestCase):
+    """The model keeps only the outer contour; with holes the class is
+    unknown (external review F5)."""
+
+    def test_holes_give_unknown(self):
+        m, f, w = place(40, top_notch(30, 50, 8))
+        self.assertEqual(w.hole_count, 0)
+        w = remeasure(m, f, "top", holes=2)
+        self.assertEqual(w.classification, "unknown")
+        self.assertEqual(w.status, "warn")
+        self.assertIn("outline has 2 hole(s), not represented", summary_line(w))
+
+    def test_summary_reads_the_model_attribute(self):
+        from plugin.constraint_summary import measure_antenna_windows
+        m, f, w = place(40, top_notch(30, 50, 8))
+        self.assertEqual([x.classification for x in measure_antenna_windows(m, m._cset)],
+                         ["window"])
+        m.outline_hole_count = 1
+        self.assertEqual([x.classification for x in measure_antenna_windows(m, m._cset)],
+                         ["unknown"])
+
+    def test_old_model_without_the_attribute(self):
+        from plugin.board_model import BoardModel
+        self.assertEqual(BoardModel.outline_hole_count, 0)
+        self.assertTrue(SINGLE_CONTOUR_NOTE.startswith("single outer contour"))
 
 class TestBrokenCase(unittest.TestCase):
     def test_bbox_instead_of_polygon_would_call_the_window_material(self):
