@@ -25,7 +25,7 @@ from plugin.board_model import ComponentGroup  # noqa: E402
 from plugin.constraints import (unlock_constrained, unlock_refs, unlock_indices,  # noqa: E402
                                 constrained_refs, load_constraints, apply_constraints)
 from plugin.constraint_summary import (summarize, format_text, edge_distance_nm,  # noqa: E402
-                                       ROUNDING_TOL_NM, FULL_CHECK)
+                                       ROUNDING_TOL_NM, FULL_CHECK, measure_edge_locks)
 from plugin.cost_function import CostState  # noqa: E402
 from plugin.moves import EDGE_LOCK_MARGIN, resnap_edges  # noqa: E402
 from plugin.annealer import run_sa, SAConfig  # noqa: E402
@@ -243,6 +243,40 @@ class TestFixed(unittest.TestCase):
             {"ref": "R0", "x_mm": 1, "y_mm": 1}]})
         apply(m, d)
         self.assertEqual(summarize(m).checks, [])
+
+
+class TestAntennaOutward(unittest.TestCase):
+    """antenna_outward locks: module end on the edge, antenna side faces it."""
+
+    def _model(self):
+        sys.path.insert(0, os.path.dirname(__file__))
+        from test_antenna_outward import board, cset
+        from test_antenna_keepout import module_fp
+        m = board(module_fp(x=37 * MM, y=37 * MM, angle=90.0))
+        apply_constraints(m, cset("top"), log=None)
+        return m
+
+    def _checks(self, m):
+        return {c.item: c for c in measure_edge_locks(m)}
+
+    def test_pass_after_apply(self):
+        c = self._checks(self._model())
+        self.assertTrue(c["U3"].passed)
+        self.assertTrue(c["U3 antenna"].passed)
+
+    def test_wrong_direction_fails(self):
+        # broken case: the part turned 180 degrees after the run
+        m = self._model()
+        m.footprints[0].set_angle(180.0)
+        c = self._checks(m)
+        self.assertFalse(c["U3 antenna"].passed)
+        self.assertIn("faces the bottom edge", c["U3 antenna"].detail)
+
+    def test_module_end_off_the_edge_fails(self):
+        # broken case: the part 2 mm inside, the module end no longer on the edge
+        m = self._model()
+        m.footprints[0].y += 2 * MM
+        self.assertFalse(self._checks(m)["U3"].passed)
 
 
 class TestText(unittest.TestCase):

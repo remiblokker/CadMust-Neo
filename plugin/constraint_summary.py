@@ -13,6 +13,9 @@ term (or the snap / lock) did not get what it asked for:
                  polygonal outline the polygon edge     (1.0 mm, where the snap puts
                  over the bbox span (moves.resnap_edges, it) + 1 um rounding;
                  cost_function.polygon_edge_limit)      a part past the edge passes
+                 antenna_outward lock: the module end   module end within 1 um of
+                 (Footprint.edge_anchor_world) to the   the edge, and the antenna
+                 edge, plus the antenna direction       side faces the locked edge
     fixed        footprint position vs the file's x/y   error <= 1 um (apply sets it
                  (board-relative, apply_constraints)    exactly, then locks it)
 
@@ -31,7 +34,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .constraints import MM, ZONES, zone_rect_nm
+from .constraints import MM, ZONES, zone_rect_nm, facing_edge
 from .cost_function import polygon_edge_limit
 from .moves import EDGE_LOCK_MARGIN, _edge_snap_polygon
 
@@ -157,6 +160,7 @@ def edge_distance_nm(model, fi: int) -> Optional[float]:
         return None
     poly = _edge_snap_polygon(model)
     x1, y1, x2, y2 = f.bbox
+    anc = f.edge_anchor_world()
     ref = {"left": model.outline_xmin, "right": model.outline_xmax,
            "top": model.outline_ymin, "bottom": model.outline_ymax}[edge]
     if poly is not None:
@@ -164,6 +168,9 @@ def edge_distance_nm(model, fi: int) -> Optional[float]:
         lim = polygon_edge_limit(poly, edge, lo, hi)
         if lim is not None:
             ref = int(round(lim))
+    if anc is not None:     # antenna_outward: the module end, not the bbox
+        x1 = x2 = anc[0]
+        y1 = y2 = anc[1]
     return {"left": x1 - ref, "right": ref - x2,
             "top": y1 - ref, "bottom": ref - y2}[edge]
 
@@ -177,6 +184,15 @@ def measure_edge_locks(model) -> List[Check]:
         if d is None:
             continue
         f = model.footprints[fi]
+        side = getattr(f, "antenna_side", None)
+        if side is not None and f.edge_anchor_world() is not None:
+            ok = abs(d) <= ROUNDING_TOL_NM
+            out.append(Check("edge_lock", f.reference, ok, d / MM, 0.0,
+                             "module end %.2f mm from the %s edge" % (d / MM, f.edge_lock)))
+            faces = facing_edge(side, f.angle_deg)
+            out.append(Check("edge_lock", f.reference + " antenna", faces == f.edge_lock,
+                             0.0, 0.0, "antenna side %s faces the %s edge" % (side, faces)))
+            continue
         ok = d <= limit
         past = " (reaches past the edge)" if d < -ROUNDING_TOL_NM else ""
         out.append(Check("edge_lock", f.reference, ok, d / MM, EDGE_LOCK_MARGIN / MM,
