@@ -71,8 +71,9 @@ degrees, from pad CENTRES (the model stores no pad sizes):
   is part of the physical module and must stay free too, so depth_mm does
   not move the rect; it is reported and cross-checked only.
 
-constrained_refs() lists every reference the file places; unlock_refs()
-clears the board lock on those parts (batch_runner --unlock constrained).
+constrained_refs() lists every reference the file places; unlock_constrained()
+clears the board lock on those parts (batch_runner --unlock constrained and the
+plugin GUI share it; unlock_refs / unlock_indices are its building blocks).
 """
 from __future__ import annotations
 
@@ -590,6 +591,14 @@ def unlock_refs(model: BoardModel, refs) -> List[str]:
     nothing else changes. Returns the references whose lock flag was cleared,
     sorted; footprints that were not locked are not listed."""
     fps = model.footprints
+    return sorted(fps[i].reference for i in unlock_indices(model, refs))
+
+
+def unlock_indices(model: BoardModel, refs) -> List[int]:
+    """unlock_refs, returning the cleared footprint INDICES in index order
+    (a duplicate reference pulled in through a group stays distinguishable,
+    which the plugin needs to write the part back to a KiCad-locked footprint)."""
+    fps = model.footprints
     by_ref: Dict[str, int] = {}
     for i, f in enumerate(fps):
         by_ref.setdefault(f.reference, i)
@@ -600,11 +609,11 @@ def unlock_refs(model: BoardModel, refs) -> List[str]:
         if gi is not None:
             groups.add(gi)
             targets.update(model.component_groups[gi].member_indices)
-    cleared = []
+    cleared: List[int] = []
     for idx in sorted(targets):
         if fps[idx].locked:
             fps[idx].locked = False
-            cleared.append(fps[idx].reference)
+            cleared.append(idx)
     for gi in groups:
         model.component_groups[gi].locked = False
     candidates = set(model.moveable_indices) | targets
@@ -618,7 +627,25 @@ def unlock_refs(model: BoardModel, refs) -> List[str]:
                 candidates.add(grp.member_indices[0])
     model.moveable_indices = [i for i, f in enumerate(fps)
                               if i in candidates and not f.locked and i not in excluded]
-    return sorted(cleared)
+    return cleared
+
+
+def unlock_constrained(model: BoardModel, constraints,
+                       allowed=None) -> Tuple[set, List[str], List[int]]:
+    """The one implementation of "parts the constraint file names lose their
+    board lock" (batch_runner --unlock constrained, the plugin GUI whenever a
+    constraints file is set). Call it BEFORE apply_constraints.
+
+    allowed: optional set of references that may be unlocked (the GUI passes
+    the selected parts under "Move selected components only", so a part the
+    user left unselected stays put); None = every named part.
+
+    Returns (named, cleared_refs, cleared_indices): every reference the file
+    names, the sorted references whose lock was cleared, and their indices."""
+    named = constrained_refs(constraints)
+    refs = named if allowed is None else named & set(allowed)
+    idx = unlock_indices(model, refs)
+    return named, sorted(model.footprints[i].reference for i in idx), idx
 
 
 # ---------------------------------------------------------------------------

@@ -45,7 +45,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 from plugin.annealer import run_sa, SAConfig
 from plugin.cost_function import CostState
 from plugin.constraints import (load_constraints, apply_constraints, ConstraintError,
-                                constrained_refs, unlock_refs)
+                                unlock_constrained)
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +156,7 @@ def prepare_locks(model, mode, cset):
     if mode == "constrained":
         if cset is None:
             raise ValueError("--unlock constrained needs --constraints")
-        named = constrained_refs(cset)
-        refs = unlock_refs(model, named)
+        named, refs, _idx = unlock_constrained(model, cset)
         return lock_edge_connectors(model, exclude_refs=named | set(refs)), refs
     return lock_edge_connectors(model), []
 
