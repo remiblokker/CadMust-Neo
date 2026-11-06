@@ -253,6 +253,40 @@ class TestEdgeLockAgainstKeepout(unittest.TestCase):
         self.assertTrue(r["flagged"], r)        # CostState counts it: the GUI shows it
 
 
+class TestGeometricScan(unittest.TestCase):
+    """constraint_summary.rule_area_intrusions (external review F4): the
+    costed GUI count reads CostState._fp_keepout, which is 0 for locked
+    parts; the geometric scan lists every part, locked and fixed included."""
+
+    def test_locked_part_inside_costs_nothing_and_is_listed(self):
+        from plugin.constraint_summary import rule_area_intrusions, intrusion_text
+        m = build(k=1, start=(30, 20))
+        m.footprints[0].locked = True
+        m.moveable_indices = []
+        self.assertEqual(CostState(m, quiet=True)._fp_keepout, {})     # costed: 0
+        hits = rule_area_intrusions(m)
+        self.assertEqual([(r, ki) for r, ki, _d in hits], [("P", 0)])
+        self.assertAlmostEqual(hits[0][2], 5.5, places=6)    # min(31-25, 35-29, 20.5-15, 25-19.5)
+        self.assertIn("1 (P 5.50 mm; layers ignored)", intrusion_text(hits))
+
+    def test_movable_part_is_listed_too_and_outside_is_none(self):
+        from plugin.constraint_summary import rule_area_intrusions, intrusion_text
+        m = build(k=1, start=(30, 15.1))         # bbox y 14.6..15.6: 0.6 mm deep
+        self.assertIn(0, CostState(m, quiet=True)._fp_keepout)
+        hits = rule_area_intrusions(m)
+        self.assertAlmostEqual(hits[0][2], 0.6, places=6)
+        self.assertEqual(rule_area_intrusions(build(k=1, start=(30, 14.5))), [])  # touching
+        self.assertEqual(intrusion_text([]), "none")
+
+    def test_corner_graze_is_shallow(self):
+        from plugin.cost_function import keepout_intrusion_depth
+        k = ko(KO)
+        # bbox 24.9..26.9 x 14.9..15.9: 2 x 1 overlap at the corner
+        d = keepout_intrusion_depth(int(23.9 * MM), int(14.4 * MM), int(25.9 * MM),
+                                    int(15.4 * MM), k) / MM
+        self.assertAlmostEqual(d, 0.4, places=6)
+
+
 class TestPenaltyBound(unittest.TestCase):
     """Finding, not a desired behaviour: the term is bounded by (w + h) x 100
     = 300 mm for P, the HPWL gain grows with the net count (11 mm per net

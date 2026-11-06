@@ -330,7 +330,8 @@ class _ResultsDialog(wx.Dialog):
     def __init__(self, parent, *, hpwl_before_mm, hpwl_after_mm, hpwl_change_pct,
                  n_overlaps, n_keepout, n_silk_moved, elapsed, total_moves,
                  accepted_moves, constraints_text=None, constraints_pass=0,
-                 constraints_fail=0, notes_text=None):
+                 constraints_fail=0, notes_text=None, geo_intrusions_text="none",
+                 n_geo_intrusions=0):
         super().__init__(parent, title="CadMust-Neo \u2014 Results",
                          style=wx.DEFAULT_DIALOG_STYLE)
 
@@ -397,11 +398,15 @@ class _ResultsDialog(wx.Dialog):
         else:
             add_metric(self._CROSS, red, "Overlaps", f"{n_overlaps} pairs")
 
-        # Keep-out violations
+        # Keep-out violations: costed (movable parts, from the cost cache)
+        # and the geometric scan over all parts incl. locked and fixed ones
         if n_keepout == 0:
-            add_metric(self._CHECK, green, "Keep-out violations", "none")
+            add_metric(self._CHECK, green, "Keep-out violations (costed)", "none")
         else:
-            add_metric(self._CROSS, red, "Keep-out violations", f"{n_keepout}")
+            add_metric(self._CROSS, red, "Keep-out violations (costed)", f"{n_keepout}")
+        add_metric(self._CHECK if n_geo_intrusions == 0 else self._CROSS,
+                   green if n_geo_intrusions == 0 else red,
+                   "Rule-area intrusions (geometric, all parts)", geo_intrusions_text)
 
         # Silkscreen (neutral — always informational)
         silk_msg = f"{n_silk_moved} refs repositioned" if n_silk_moved > 0 else "no changes needed"
@@ -866,8 +871,11 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         # Count overlapping pairs
         n_overlaps = sum(1 for v in verify_cs._pair_overlaps.values() if v > 0)
 
-        # Count keepout violations
+        # Count keepout violations: the cost cache (movable parts only, 0 for
+        # locked ones) and a geometric scan over all parts (review F4)
         n_keepout = sum(1 for v in verify_cs._fp_keepout.values() if v > 0)
+        from .constraint_summary import rule_area_intrusions, intrusion_text
+        geo_intrusions = rule_area_intrusions(verify_model)
 
         # Constraint satisfaction, measured on the positions now on the board
         constraints_text = None
@@ -894,7 +902,8 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
             f"Optimization complete!\n\n"
             f"{hpwl_msg}\n"
             f"Overlaps: {n_overlaps} pairs\n"
-            f"Keep-out violations: {n_keepout}\n"
+            f"Keep-out violations (costed): {n_keepout}\n"
+            f"Rule-area intrusions (geometric, all parts): {intrusion_text(geo_intrusions)}\n"
             f"Silkscreen: {n_silk_moved} refs repositioned\n"
             f"Moves: {result.total_moves} total, {result.accepted_moves} accepted\n"
             f"Time: {elapsed:.1f}s"
@@ -920,6 +929,8 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
             hpwl_change_pct=hpwl_change_pct,
             n_overlaps=n_overlaps,
             n_keepout=n_keepout,
+            geo_intrusions_text=intrusion_text(geo_intrusions),
+            n_geo_intrusions=len(geo_intrusions),
             n_silk_moved=n_silk_moved,
             elapsed=elapsed,
             total_moves=result.total_moves,

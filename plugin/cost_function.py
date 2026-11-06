@@ -441,6 +441,18 @@ def bbox_outside_polygon(bbox: Tuple[int, int, int, int],
     return excess
 
 
+def keepout_intrusion_depth(x1, y1, x2, y2, ko) -> float:
+    """Intrusion depth of the bbox (x1, y1, x2, y2) in keep-out rect `ko`
+    (anything with xmin/ymin/xmax/ymax): the shortest axis translation that
+    makes the intersection empty, min over the four directions; 0 when they
+    do not overlap (touching counts as not overlapping). Small at a corner
+    graze, it grows towards the keep-out centre. Geometric: it ignores the
+    board edge and KeepOut.layers."""
+    if min(x2, ko.xmax) - max(x1, ko.xmin) <= 0 or min(y2, ko.ymax) - max(y1, ko.ymin) <= 0:
+        return 0.0
+    return float(min(x2 - ko.xmin, ko.xmax - x1, y2 - ko.ymin, ko.ymax - y1))
+
+
 def _pair_key(i: int, j: int) -> Tuple[int, int]:
     return (i, j) if i < j else (j, i)
 

@@ -45,7 +45,8 @@ from typing import Dict, List, Optional, Tuple
 from .constraints import (MM, ZONES, zone_rect_nm, facing_edge, resolve_antenna_item,
                           AntennaError)
 from .antenna_window import antenna_window, summary_line
-from .cost_function import polygon_edge_limit, anchor_edge_reference
+from .cost_function import (polygon_edge_limit, anchor_edge_reference,
+                            keepout_intrusion_depth)
 from .moves import EDGE_LOCK_MARGIN, _edge_snap_polygon
 
 # apply_constraints rounds a fixed position to whole nm and resnap_edges
@@ -265,6 +266,36 @@ def measure_antenna_windows(model, cset) -> list:
         out.append(antenna_window(f, res, f.edge_lock, poly, outline,
                                   holes=getattr(model, "outline_hole_count", 0)))
     return out
+
+
+def rule_area_intrusions(model) -> List[Tuple[str, int, float]]:
+    """Geometric scan of footprint rule areas (model.keepouts, KiCad rule
+    areas that forbid footprints): every part whose courtyard bbox enters a
+    keep-out rect, INCLUDING locked and fixed parts (the cost cache, which
+    the GUI's costed "Keep-out violations" count reads, is 0 for locked
+    parts; external review F4). KeepOut.layers is ignored, as in the cost
+    term. Returns (ref, keep-out index, intrusion depth in mm) per pair,
+    depth = cost_function.keepout_intrusion_depth."""
+    out = []
+    kos = getattr(model, "keepouts", None) or []
+    for f in model.footprints:
+        x1, y1, x2, y2 = f.bbox
+        for ki, ko in enumerate(kos):
+            d = keepout_intrusion_depth(x1, y1, x2, y2, ko)
+            if d > 0:
+                out.append((f.reference, ki, d / MM))
+    return out
+
+
+def intrusion_text(intrusions, max_listed: int = 8) -> str:
+    """"N" plus the worst intrusions, for the results dialog."""
+    if not intrusions:
+        return "none"
+    worst = sorted(intrusions, key=lambda t: -t[2])[:max_listed]
+    more = len(intrusions) - len(worst)
+    return "%d (%s%s; layers ignored)" % (
+        len(intrusions), ", ".join("%s %.2f mm" % (r, d) for r, _k, d in worst),
+        ", +%d more" % more if more else "")
 
 
 def summarize(model, cset=None) -> ConstraintSummary:
