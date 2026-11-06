@@ -47,7 +47,13 @@ _DEFAULTS: Dict[str, Any] = {
     "congestion_enabled": False,
     "congestion_weight": 2.0,
     "congestion_bin_size": 5.0,   # mm (converted to nm before passing to SAConfig)
+    "constraints_file": "",       # path to a constraint JSON, "" = none
 }
+
+_CONSTRAINTS_TOOLTIP = (
+    "A constraint file (JSON, e.g. from CadMust-Autopilot) with groups, edge locks,\n"
+    "zones and fixed positions that the optimizer follows; parts the file names\n"
+    "lose their board lock for this run.")
 
 
 def load_settings() -> Dict[str, Any]:
@@ -189,6 +195,24 @@ class SettingsDialog(wx.Dialog):
         self._chk_congestion.Bind(wx.EVT_CHECKBOX, self._on_congestion_toggle)
         main_sizer.Add(self._chk_congestion, 0,
                        wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        # --- Constraints file (all modes, optional) ---
+        lbl_cons = wx.StaticText(self, label="Constraints file (optional):")
+        lbl_cons.SetToolTip(_CONSTRAINTS_TOOLTIP)
+        main_sizer.Add(lbl_cons, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        cons_row = wx.BoxSizer(wx.HORIZONTAL)
+        self._picker_constraints = wx.FilePickerCtrl(
+            self, message="Choose a constraint file",
+            wildcard="JSON files (*.json)|*.json|All files (*.*)|*.*",
+            style=wx.FLP_OPEN | wx.FLP_USE_TEXTCTRL)
+        self._picker_constraints.SetToolTip(_CONSTRAINTS_TOOLTIP)
+        cons_row.Add(self._picker_constraints, 1, wx.ALIGN_CENTER_VERTICAL)
+        btn_clear = wx.Button(self, label="Clear", style=wx.BU_EXACTFIT)
+        btn_clear.SetToolTip("No constraints file: optimize as without one.")
+        btn_clear.Bind(wx.EVT_BUTTON,
+                       lambda evt: self._picker_constraints.SetPath(""))
+        cons_row.Add(btn_clear, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 6)
+        main_sizer.Add(cons_row, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
 
         # --- Parameters box (Normal + Expert) ---
         self._params_box = wx.StaticBox(self, label="Parameters")
@@ -484,6 +508,7 @@ class SettingsDialog(wx.Dialog):
         self._chk_congestion.SetValue(bool(s.get("congestion_enabled", False)))
         self._spin_congestion_weight.SetValue(float(s.get("congestion_weight", 10.0)))
         self._spin_congestion_bin.SetValue(float(s.get("congestion_bin_size", 2.0)))
+        self._picker_constraints.SetPath(str(s.get("constraints_file", "") or ""))
 
     def _on_preset_change(self, evt):
         """When preset changes in Expert mode, update the parameter controls."""
@@ -548,6 +573,11 @@ class SettingsDialog(wx.Dialog):
     def move_selected_only(self) -> bool:
         """True if only selected components should be moved."""
         return self._chk_selected_only.GetValue()
+
+    @property
+    def constraints_file(self) -> str:
+        """Path of the constraint JSON, or "" when the field is empty."""
+        return self._picker_constraints.GetPath().strip()
 
     @property
     def excluded_net_names(self):
@@ -621,6 +651,7 @@ class SettingsDialog(wx.Dialog):
             "congestion_enabled": self._chk_congestion.GetValue(),
             "congestion_weight": self._spin_congestion_weight.GetValue(),
             "congestion_bin_size": self._spin_congestion_bin.GetValue(),
+            "constraints_file": self.constraints_file,
         }
         save_settings(data)
         self.EndModal(wx.ID_OK)

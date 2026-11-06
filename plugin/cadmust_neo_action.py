@@ -1,4 +1,5 @@
 """CadMust-Neo KiCad Action Plugin — entry point."""
+import copy
 import os
 import pcbnew
 import wx
@@ -8,6 +9,14 @@ from .board_model import extract_board_model
 from .cost_function import CostState
 from .annealer import run_sa, SAResult
 from .placement import save_original_positions, restore_original_positions, apply_model_to_board
+from .constraints import (load_constraints, apply_constraints, unlock_constrained,
+                          ConstraintError)
+
+# Cohesion and zone weights used when a constraints file is set: the
+# CadMust-Autopilot optimize default (C = Z = 100, chosen by its weight sweep).
+# SAConfig's own default (1.0) is too weak to move groups and zones; without
+# a constraints file both terms are empty, so the weight has no effect.
+GUI_CONSTRAINT_WEIGHT = 100.0
 
 
 def _write_debug_log(model, verify_model, model_cs, verify_cs):
@@ -318,7 +327,8 @@ class _ResultsDialog(wx.Dialog):
 
     def __init__(self, parent, *, hpwl_before_mm, hpwl_after_mm, hpwl_change_pct,
                  n_overlaps, n_keepout, n_silk_moved, elapsed, total_moves,
-                 accepted_moves):
+                 accepted_moves, constraints_text=None, constraints_pass=0,
+                 constraints_fail=0):
         super().__init__(parent, title="CadMust-Neo \u2014 Results",
                          style=wx.DEFAULT_DIALOG_STYLE)
 
@@ -395,7 +405,26 @@ class _ResultsDialog(wx.Dialog):
         silk_msg = f"{n_silk_moved} refs repositioned" if n_silk_moved > 0 else "no changes needed"
         add_metric(self._DASH, grey, "Silkscreen", silk_msg)
 
+        # Constraints (only when a constraints file was applied)
+        if constraints_text is not None:
+            n_c = constraints_pass + constraints_fail
+            if constraints_fail == 0:
+                add_metric(self._CHECK, green, "Constraints", f"{n_c} of {n_c} met")
+            else:
+                add_metric(self._CROSS, red, "Constraints",
+                           f"{constraints_pass} of {n_c} met, {constraints_fail} FAIL")
+
         sizer.Add(metrics_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 16)
+
+        if constraints_text is not None:
+            cbox = wx.StaticBox(self, label="Constraints")
+            csizer = wx.StaticBoxSizer(cbox, wx.VERTICAL)
+            ctext = wx.TextCtrl(self, value=constraints_text,
+                                size=wx.Size(560, 220),
+                                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+            ctext.SetFont(wx.Font(wx.FontInfo(10).Family(wx.FONTFAMILY_TELETYPE)))
+            csizer.Add(ctext, 1, wx.ALL | wx.EXPAND, 4)
+            sizer.Add(csizer, 1, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 12)
 
         # --- Stats (smaller, grey) ---
         stats_text = (
@@ -625,6 +654,7 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         config = dlg.build_config()
         selected_only = dlg.move_selected_only
         excluded_net_names = dlg.excluded_net_names
+        constraints_path = dlg.constraints_file
         dlg.Destroy()
 
         # If "move selected only" is on, verify something is selected
@@ -642,6 +672,26 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
                 )
                 return
 
+        # Constraints file: load and validate before anything moves
+        cset = None
+        if constraints_path:
+            if not os.path.isfile(constraints_path):
+                wx.MessageBox(
+                    f"Constraints file not found:\n{constraints_path}\n\n"
+                    "Choose another file or clear the field. Nothing was moved.",
+                    "CadMust-Neo", wx.OK | wx.ICON_ERROR,
+                )
+                return
+            try:
+                cset = load_constraints(constraints_path)
+            except ConstraintError as e:
+                wx.MessageBox(
+                    f"The constraints file cannot be used:\n\n{e}\n\n"
+                    "Nothing was moved.",
+                    "CadMust-Neo", wx.OK | wx.ICON_ERROR,
+                )
+                return
+
         # Save original positions for undo
         original_positions = save_original_positions(board)
 
@@ -652,8 +702,39 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         for nc, net in model.nets.items():
             net.is_excluded = net.net_name in excluded_net_names
 
+        # Apply the constraints file: parts it names lose their board lock
+        # (the same function as batch_runner --unlock constrained), then the
+        # file is applied. Without a file nothing here runs.
+        before_model = None
+        constraint_report = None
+        unlocked_refs, unlocked_idx = [], []
+        if cset is not None:
+            allowed = None
+            if selected_only:
+                # an unselected part stays put, even when the file names it
+                allowed = {fp.GetReference() for fp in board.GetFootprints()
+                           if fp.IsSelected()}
+            before_model = copy.deepcopy(model)   # HPWL "before" = board as it is
+            try:
+                _named, unlocked_refs, unlocked_idx = unlock_constrained(
+                    model, cset, allowed=allowed)
+                constraint_report = apply_constraints(model, cset, log=None)
+            except Exception as e:
+                wx.MessageBox(
+                    f"Applying the constraints file failed:\n\n{e}\n\n"
+                    "Nothing was moved.",
+                    "CadMust-Neo", wx.OK | wx.ICON_ERROR,
+                )
+                return
+            # the file's net exclusions count in "before" too
+            for nc, net in model.nets.items():
+                if nc in before_model.nets:
+                    before_model.nets[nc].is_excluded = net.is_excluded
+            config.cohesion_weight = GUI_CONSTRAINT_WEIGHT
+            config.zone_weight = GUI_CONSTRAINT_WEIGHT
+
         # Compute initial HPWL for display
-        initial_cs = CostState(model)
+        initial_cs = CostState(before_model if before_model is not None else model)
         initial_hpwl = initial_cs.hpwl
         initial_cost = initial_cs.total_cost
 
@@ -723,11 +804,16 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
                 return
 
         # Apply optimized positions to the board
-        apply_model_to_board(board, model)
+        apply_model_to_board(board, model, override_lock_indices=unlocked_idx)
 
         # Verify: re-extract model from KiCad and compare HPWL
         # This catches any position application issues
         verify_model = extract_board_model(board, selected_only=selected_only)
+        if cset is not None:
+            # same net exclusions as the run (user choice + the file)
+            excl = {net.net_name for net in model.nets.values() if net.is_excluded}
+            for net in verify_model.nets.values():
+                net.is_excluded = net.net_name in excl
         verify_cs = CostState(verify_model)
 
         # Auto-place silkscreen reference designators
@@ -755,6 +841,21 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
         # Count keepout violations
         n_keepout = sum(1 for v in verify_cs._fp_keepout.values() if v > 0)
 
+        # Constraint satisfaction, measured on the positions now on the board
+        constraints_text = None
+        c_summary = None
+        if cset is not None:
+            from .constraint_summary import summarize, format_text
+            for mfp, vfp in zip(model.footprints, verify_model.footprints):
+                if mfp.reference == vfp.reference:
+                    mfp.x, mfp.y = vfp.x, vfp.y
+                    mfp.set_angle(vfp.angle_deg)
+            c_summary = summarize(model, cset)
+            constraints_text = format_text(
+                c_summary, constraint_report, path=constraints_path,
+                weights=(config.cohesion_weight, config.zone_weight),
+                unlocked=unlocked_refs)
+
         # Build result summary for logging
         if hpwl_change_pct >= 0:
             hpwl_msg = f"HPWL: {hpwl_before_mm:.1f} mm \u2192 {hpwl_after_mm:.1f} mm ({hpwl_change_pct:.1f}% shorter)"
@@ -769,6 +870,8 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
             f"Moves: {result.total_moves} total, {result.accepted_moves} accepted\n"
             f"Time: {elapsed:.1f}s"
         )
+        if constraints_text is not None:
+            result_summary += f"\n\nConstraints\n{constraints_text}"
 
         # Append results to profile.log so they persist even if dialog is dismissed
         try:
@@ -790,6 +893,9 @@ class CadMustNeoAction(pcbnew.ActionPlugin):
             elapsed=elapsed,
             total_moves=result.total_moves,
             accepted_moves=result.accepted_moves,
+            constraints_text=constraints_text,
+            constraints_pass=c_summary.n_pass if c_summary else 0,
+            constraints_fail=c_summary.n_fail if c_summary else 0,
         )
         accepted = rdlg.ShowModal() == wx.ID_OK
         rdlg.Destroy()

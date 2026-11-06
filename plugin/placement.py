@@ -31,9 +31,16 @@ def restore_original_positions(board, positions: List[Tuple[str, int, int, float
     pcbnew.Refresh()
 
 
-def apply_model_to_board(board, model: BoardModel):
-    """Write the optimized positions from the BoardModel back to pcbnew."""
+def apply_model_to_board(board, model: BoardModel, override_lock_indices=()):
+    """Write the optimized positions from the BoardModel back to pcbnew.
+
+    KiCad-locked footprints are skipped, except the model indices in
+    override_lock_indices: parts whose board lock the run cleared because a
+    constraint file names them (constraints.unlock_constrained). Their KiCad
+    lock flag is left as it is; only the position is written."""
     import pcbnew
+
+    override = set(override_lock_indices)
 
     fps_by_uuid = {}
     fps_by_ref = {}
@@ -44,13 +51,13 @@ def apply_model_to_board(board, model: BoardModel):
             pass
         fps_by_ref[fp.GetReference()] = fp
 
-    for mfp in model.footprints:
+    for i, mfp in enumerate(model.footprints):
         kfp = fps_by_uuid.get(mfp.uuid_str) if mfp.uuid_str else None
         if kfp is None:
             kfp = fps_by_ref.get(mfp.reference)
         if kfp is None:
             continue
-        if kfp.IsLocked():
+        if kfp.IsLocked() and i not in override:
             continue
         kfp.SetPosition(pcbnew.VECTOR2I(mfp.x, mfp.y))
         kfp.SetOrientation(pcbnew.EDA_ANGLE(mfp.angle_deg, pcbnew.DEGREES_T))
