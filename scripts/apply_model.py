@@ -14,8 +14,11 @@ That function skips footprints locked on the board; a model run with
 batch_runner --unlock moved those too, so by default every footprint the
 model has as unlocked is unlocked for the apply and re-locked afterwards
 (--respect-board-locks keeps the old behaviour). The SA never flips sides,
-so board side is not written; a side mismatch between model and board is
-counted and reported, it means the pickle belongs to another board.
+but apply_constraints flips back_side parts the board has on the front
+(Footprint.side_flipped); apply_model_to_board flips those on the board too
+and the report lists them under "flipped". Any other side mismatch between
+model and board is counted as side_mismatch: the pickle belongs to another
+board.
 
 save_optimized.py is the corpus-layout counterpart (position JSON files,
 no pickle); it is left unchanged.
@@ -68,17 +71,14 @@ def main(argv=None) -> int:
             unmatched += 1
             continue
         matched += 1
-        if bool(getattr(mfp, "is_front", True)) == bool(kfp.IsFlipped()):
+        if (bool(getattr(mfp, "is_front", True)) == bool(kfp.IsFlipped())
+                and not getattr(mfp, "side_flipped", False)):
             side_mismatch += 1
         if kfp.IsLocked() and not mfp.locked and not args.respect_board_locks:
             kfp.SetLocked(False)
             unlocked_for_apply.append(kfp)
 
-    try:
-        apply_model_to_board(board, model)
-    except AttributeError:
-        # pcbnew.Refresh() needs a running editor; positions are already set.
-        pass
+    flipped = apply_model_to_board(board, model) or []
     for kfp in unlocked_for_apply:
         kfp.SetLocked(True)
 
@@ -98,6 +98,7 @@ def main(argv=None) -> int:
     report = {"model": args.model, "board": args.board, "out": str(out),
               "matched": matched, "unmatched": unmatched,
               "side_mismatch": side_mismatch,
+              "flipped": flipped,
               "relocked_after_apply": len(unlocked_for_apply)}
     sys.stdout.write(json.dumps(report) + "\n")
     return 1 if side_mismatch or matched == 0 else 0

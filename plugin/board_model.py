@@ -86,6 +86,15 @@ class Pad:
         return (fp_x + rx, fp_y + ry)
 
 
+def _flip_layer_name(name: str) -> str:
+    """F.Fab <-> B.Fab etc.; layers without a side prefix stay."""
+    if name.startswith("F."):
+        return "B." + name[2:]
+    if name.startswith("B."):
+        return "F." + name[2:]
+    return name
+
+
 @dataclass
 class Footprint:
     """A component on the board."""
@@ -129,6 +138,10 @@ class Footprint:
     # cross-checks (a Fab outline may be drawn as large as the courtyard).
     # Never defines a keep-out. None = none / old model.
     drawing_rects: Optional[Dict[str, Tuple[int, int, int, int]]] = None
+    # True when apply_constraints moved the part to the other board side
+    # (Footprint.flip_side); apply_model.py then flips it on the board too.
+    # Class default, so older pickles read False.
+    side_flipped: bool = False
     # Cached trig values for abs_position (updated via set_angle)
     _cos_a: float = field(init=False, repr=False, default=1.0)
     _sin_a: float = field(init=False, repr=False, default=0.0)
@@ -206,6 +219,37 @@ class Footprint:
             ys.append(lx * s + ly * c)
         return (self.x + int(round(min(xs))), self.y + int(round(min(ys))),
                 self.x + int(round(max(xs))), self.y + int(round(max(ys))))
+
+    def flip_side(self) -> None:
+        """Move the part to the other board side, in place.
+
+        Mirrors the footprint exactly as KiCad's FOOTPRINT::Flip(position,
+        FLIP_DIRECTION_TOP_BOTTOM) does around the footprint's own origin:
+        the position stays, every local y (pads, courtyard bbox offset, TH
+        rects, attached keep-out rects, drawing rects) is negated, and the
+        orientation becomes -angle. A model extracted from the flipped board
+        then has the same local geometry and angle, because extraction
+        un-rotates the as-placed (already mirrored) pad positions. The bbox
+        width/height do not change. Toggles is_front and side_flipped.
+        """
+        def my(r):
+            return (r[0], -r[3], r[2], -r[1])
+        for pad in self.pads:
+            pad.offset_y = -pad.offset_y
+        self.cy_offset = -self.cy_offset
+        self.th_rects = [my(r) for r in (getattr(self, 'th_rects', None) or [])]
+        ko = getattr(self, 'keepout_rects', ())
+        if ko:
+            self.keepout_rects = tuple(my(r) for r in ko)
+        dr = getattr(self, 'drawing_rect', None)
+        if dr is not None:
+            self.drawing_rect = my(dr)
+        drs = getattr(self, 'drawing_rects', None)
+        if drs:
+            self.drawing_rects = {_flip_layer_name(k): my(v) for k, v in drs.items()}
+        self.set_angle((-self.angle_deg) % 360.0)
+        self.is_front = not getattr(self, 'is_front', True)
+        self.side_flipped = not getattr(self, 'side_flipped', False)
 
     @property
     def keepout_bboxes(self) -> List[Tuple[int, int, int, int]]:
