@@ -75,6 +75,11 @@ class SAResult:
     total_moves: int
     accepted_moves: int
     cost_history: List[Tuple[int, float]] = field(default_factory=list)
+    # Raw HPWL (nm) of each start's starting state, measured after the
+    # restore/scatter and before T0 calibration: the placement the SA of that
+    # start actually began from. start_hpwls[0] is the designer placement
+    # unless scatter_first_start is set.
+    start_hpwls: List[int] = field(default_factory=list)
 
 
 def auto_calibrate_t0(
@@ -610,6 +615,7 @@ def run_sa(
     global_best_positions = _snapshot_positions(model)
 
     cost_history: List[Tuple[int, float]] = [(0, global_best_cost)]
+    start_hpwls: List[int] = []
     total_moves = 0
     total_accepted = 0
     total_steps = 0
@@ -637,6 +643,7 @@ def run_sa(
                                congestion_bin_size=config.congestion_bin_size,
                                cohesion_weight=config.cohesion_weight,
                                zone_weight=config.zone_weight)
+        start_hpwls.append(int(cost_state.hpwl))
 
         # Calibrate T0 for this starting placement
         t0 = auto_calibrate_t0(model, cost_state, config)
@@ -781,6 +788,7 @@ def run_sa(
         total_moves=total_moves,
         accepted_moves=total_accepted,
         cost_history=cost_history,
+        start_hpwls=start_hpwls,
     )
 
 

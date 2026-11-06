@@ -230,7 +230,36 @@ CSV_FIELDS = [
     "time_s", "temperature_steps", "total_moves", "accepted_moves",
     "accepted_pct",
     "seed", "cohesion_weight", "zone_weight",
+    # Appended 2026-11-06 (older CSVs lack them): the SA's own start state
+    # (after --scatter-start) and the off-board move policy.
+    "hpwl_start_mm", "offboard",
 ]
+
+
+def start_hpwl_fields(result, hpwl_designer_mm, scatter_start):
+    """HPWL keys for the result JSON.
+
+    hpwl_designer_mm  the placement in the pickle, before run_sa (the
+                      designer's, unless the pickle was placed by something)
+    hpwl_start_mm     the state the SA actually started from: start 0 after
+                      the scatter when --scatter-start is set, else equal to
+                      hpwl_designer_mm (measured inside run_sa, before T0
+                      calibration)
+    hpwl_starts_mm    the same for every start of a multi-start run (starts
+                      1.. are always scattered)
+    hpwl_before_mm    kept for older readers: the designer value (NOT the
+                      scattered start)
+    hpwl_scatter_start_mm  hpwl_start_mm when --scatter-start is set, else None
+    """
+    starts = [round(h / MM, 1) for h in (getattr(result, "start_hpwls", None) or [])]
+    start = starts[0] if starts else None
+    return {
+        "hpwl_designer_mm": round(hpwl_designer_mm, 1),
+        "hpwl_start_mm": start,
+        "hpwl_starts_mm": starts,
+        "hpwl_before_mm": round(hpwl_designer_mm, 1),
+        "hpwl_scatter_start_mm": start if scatter_start else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +328,8 @@ def run_single_model(args, cset) -> int:
     overlaps_after = count_overlaps(model)
     improvement = (hpwl_before - hpwl_after) / hpwl_before * 100 if hpwl_before > 0 else 0.0
     accepted_pct = result.accepted_moves / result.total_moves * 100 if result.total_moves > 0 else 0.0
+    if args.scatter_start and result.start_hpwls:
+        print(f"  {board_name}: SA start 0 (scattered) at {result.start_hpwls[0] / MM:.0f} mm HPWL")
     print(f"  {board_name}: {hpwl_before:.0f} -> {hpwl_after:.0f} mm ({improvement:+.1f}%), "
           f"overlaps {overlaps_before} -> {overlaps_after}, {elapsed:.1f}s")
 
@@ -320,6 +351,8 @@ def run_single_model(args, cset) -> int:
         "seed": config.seed,
         "cohesion_weight": config.cohesion_weight,
         "zone_weight": config.zone_weight,
+        "hpwl_start_mm": (round(result.start_hpwls[0] / MM, 1)
+                          if result.start_hpwls else None),
         "offboard": config.offboard,
     }
     if args.out:
@@ -338,6 +371,7 @@ def run_single_model(args, cset) -> int:
 
     if args.result_json:
         res = dict(row)
+        res.update(start_hpwl_fields(result, hpwl_before, args.scatter_start))
         res["model"] = str(pkl_path)
         res["constraints"] = args.constraints
         res["scatter_start"] = bool(args.scatter_start)
@@ -381,7 +415,9 @@ def main():
                         help="Constraint JSON (CadMust-Autopilot schema v1/v2), applied "
                              "after loading each model and after edge-connector locking")
     parser.add_argument("--scatter-start", action="store_true",
-                        help="Scatter start 0 too (do not seed SA with the existing placement)")
+                        help="Scatter start 0 too (do not seed SA with the existing placement). "
+                             "hpwl_before_mm / hpwl_designer_mm stay the HPWL of the pickle's "
+                             "placement; hpwl_start_mm is the scattered state the SA began from")
     parser.add_argument("--unlock", nargs="?", const="all", default=None,
                         choices=UNLOCK_MODES,
                         help="'all' (also the bare flag): clear all KiCad lock flags from "
@@ -396,7 +432,11 @@ def main():
     parser.add_argument("--save-model", default=None,
                         help="With --model: pickle the optimised BoardModel to this path")
     parser.add_argument("--result-json", default=None,
-                        help="With --model: write a one-object JSON result to this path")
+                        help="With --model: write a one-object JSON result to this path. "
+                             "HPWL keys: hpwl_designer_mm (= hpwl_before_mm, the pickle's "
+                             "placement), hpwl_start_mm (the SA's start 0 after any scatter), "
+                             "hpwl_starts_mm (every start), hpwl_after_mm (result); "
+                             "hpwl_improvement_pct is designer -> after")
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed the RNG once at the start of each SA run "
                              "(reproduces the whole multi-start run)")
@@ -561,6 +601,9 @@ def main():
                 "seed": config.seed,
                 "cohesion_weight": config.cohesion_weight,
                 "zone_weight": config.zone_weight,
+                "hpwl_start_mm": (round(result.start_hpwls[0] / MM, 1)
+                                  if result.start_hpwls else None),
+                "offboard": config.offboard,
             }
             writer.writerow(row)
             csv_file.flush()
