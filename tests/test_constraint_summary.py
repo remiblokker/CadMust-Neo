@@ -308,11 +308,59 @@ class TestText(unittest.TestCase):
 
 
 class TestNoGuiImports(unittest.TestCase):
+    """constraint_summary must import without wx and pcbnew.
+
+    Checking sys.modules after a plain import is not enough under KiCad's
+    Python: there pcbnew is importable, so plugin/__init__.py (the action
+    plugin registration) imports pcbnew and wx before constraint_summary is
+    even read, and the old check failed on every commit. The child process
+    (-I: no user site, no PYTHONPATH, no cwd on sys.path) blocks both names
+    with a meta-path finder instead, so the package init falls back to its
+    ImportError branch. The finder records every attempt; the record is
+    cleared after the package itself is imported, and any wx/pcbnew attempt
+    by constraint_summary or what it pulls in (also a guarded try/except
+    import) fails the test. Same result on both interpreters."""
+
+    CODE = (
+        "import sys, importlib\n"
+        "tried = []\n"
+        "class Block:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name.split('.')[0] in ('wx', 'pcbnew'):\n"
+        "            tried.append(name)\n"
+        "            raise ImportError('blocked: ' + name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Block())\n"
+        "sys.path.insert(0, %r)\n"
+        "mod = %r\n"
+        "importlib.import_module(mod.split('.')[0])\n"
+        "del tried[:]\n"
+        "try:\n"
+        "    importlib.import_module(mod)\n"
+        "except ImportError as e:\n"
+        "    print(e); sys.exit(2)\n"
+        "bad = tried + [m for m in ('wx', 'pcbnew') if m in sys.modules]\n"
+        "sys.exit(1 if bad else 0)\n")
+
+    def _run(self, root, module):
+        return subprocess.call([sys.executable, "-I", "-c", self.CODE % (root, module)],
+                               stdout=subprocess.DEVNULL)
+
     def test_module_imports_neither_wx_nor_pcbnew(self):
-        code = ("import sys; sys.path.insert(0, %r); import plugin.constraint_summary; "
-                "bad = [m for m in ('wx', 'pcbnew') if m in sys.modules]; "
-                "sys.exit(1 if bad else 0)" % ROOT)
-        self.assertEqual(subprocess.call([sys.executable, "-c", code]), 0)
+        self.assertEqual(self._run(ROOT, "plugin.constraint_summary"), 0)
+
+    def test_check_catches_a_gui_import(self):
+        # deliberately broken cases: a plain and a guarded GUI import must fail
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "pkg"))
+            open(os.path.join(d, "pkg", "__init__.py"), "w").close()
+            with open(os.path.join(d, "pkg", "gui.py"), "w") as fh:
+                fh.write("import pcbnew\n")
+            with open(os.path.join(d, "pkg", "guarded.py"), "w") as fh:
+                fh.write("try:\n    import wx\nexcept ImportError:\n    wx = None\n")
+            self.assertNotEqual(self._run(d, "pkg.gui"), 0)
+            self.assertNotEqual(self._run(d, "pkg.guarded"), 0)
 
 
 class TestAfterAnnealing(unittest.TestCase):
