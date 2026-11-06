@@ -217,6 +217,105 @@ class TestGreedyKeepsAngle(unittest.TestCase):
         self.assertEqual(m.footprints[0].edge_anchor_world()[1], 0)
 
 
+class TestNotchOnTheLockedEdge(unittest.TestCase):
+    """Decision 2026-11-06: an anchored part's edge reference is the
+    outermost outline point over the module's own width (the pad-centre
+    extent across the antenna side, 17.2 mm here; the courtyard is 19.6 mm),
+    the courtyard clip keeps the innermost one, plain locks are unchanged.
+    Broken case: with the old reference (innermost over the courtyard span)
+    the straddling and the wider cases put the module end on the notch
+    floor (6 mm) and fail."""
+
+    D = 6 * MM   # notch depth
+
+    def _top_poly(self, a, b):
+        d = self.D
+        return [(0, 0), (a * MM, 0), (a * MM, d), (b * MM, d), (b * MM, 0),
+                (BW, 0), (BW, BH), (0, BH)]
+
+    def _top(self, x, a=30, b=50):
+        u3 = module_fp(x=x * MM, y=37 * MM, angle=0.0)
+        m = board(u3)
+        m.outline_polygon = self._top_poly(a, b)
+        apply_constraints(m, cset("top"), log=None)
+        f = m.footprints[0]
+        f.x = x * MM
+        resnap_edges(m, [0])
+        return m, f
+
+    def test_width_is_the_pad_extent_not_the_courtyard(self):
+        m, f = self._top(40)
+        self.assertEqual(f.edge_anchor_span_nm, (int(-8.6 * MM), int(8.6 * MM)))
+        line = f.edge_anchor_span_world()
+        self.assertEqual(sorted((line[0][0], line[1][0])),
+                         [int(31.4 * MM), int(48.6 * MM)])
+
+    def test_narrower_module_straddling_a_notch_side_goes_on_the_outer_line(self):
+        # module x 23.4 .. 40.6 over a notch at x 30 .. 50
+        m, f = self._top(32)
+        self.assertLessEqual(abs(f.edge_anchor_world()[1]), 2)
+
+    def test_narrower_module_inside_the_notch_goes_on_the_floor(self):
+        # module x 31.4 .. 48.6 entirely over the notch floor
+        m, f = self._top(40)
+        self.assertLessEqual(abs(f.edge_anchor_world()[1] - self.D), 2)
+
+    def test_wider_module_spans_the_notch(self):
+        # notch x 34 .. 46 (12 mm) narrower than the 17.2 mm module width
+        m, f = self._top(40, a=34, b=46)
+        self.assertLessEqual(abs(f.edge_anchor_world()[1]), 2)
+        # the courtyard clip still uses the innermost reference (notch
+        # floor): a bbox reaching 5 mm past the outer line is cut at 6 mm
+        from plugin.moves import _boundary_bbox
+        x1, _y1, x2, y2 = f.bbox
+        self.assertEqual(_boundary_bbox(m, f, (x1, -5 * MM, x2, y2))[1], self.D)
+        # the GUI summary measures the module end the same way
+        from plugin.constraint_summary import edge_distance_nm
+        self.assertLessEqual(abs(edge_distance_nm(m, 0)), 2)
+
+    def test_left_edge_notch(self):
+        d = self.D
+        poly = [(0, 0), (BW, 0), (BW, BH), (0, BH), (0, 50 * MM), (d, 50 * MM),
+                (d, 30 * MM), (0, 30 * MM)]
+        for y, want in ((32, 0), (40, d)):
+            u3 = module_fp(x=37 * MM, y=y * MM, angle=0.0)
+            m = board(u3)
+            m.outline_polygon = poly
+            apply_constraints(m, cset("left"), log=None)
+            f = m.footprints[0]
+            f.y = y * MM
+            resnap_edges(m, [0])
+            self.assertLessEqual(abs(f.edge_anchor_world()[0] - want), 2, y)
+
+    def test_plain_lock_keeps_the_innermost_reference(self):
+        u3 = module_fp(x=40 * MM, y=37 * MM, angle=0.0)
+        m = board(u3)
+        m.outline_polygon = self._top_poly(34, 46)
+        apply_constraints(m, cset("top", outward=None), log=None)
+        f = m.footprints[0]
+        resnap_edges(m, [0])
+        self.assertIsNone(f.edge_anchor_span_world())
+        self.assertEqual(f.bbox[1], self.D + EDGE_LOCK_MARGIN)
+
+    def test_old_pickle_without_width_uses_the_bbox_span(self):
+        m, f = self._top(40, a=34, b=46)
+        del f.edge_anchor_span_nm          # instance attr gone: class default None
+        resnap_edges(m, [0])
+        self.assertLessEqual(abs(f.edge_anchor_world()[1] - self.D), 2)
+
+    def test_flip_mirrors_an_x_side_width(self):
+        f = module_fp(x=0, y=0)
+        f.antenna_side, f.edge_anchor_offset_nm = "+x", 5 * MM
+        f.edge_anchor_span_nm = (-2 * MM, 3 * MM)
+        f.flip_side()
+        self.assertEqual(f.edge_anchor_span_nm, (-3 * MM, 2 * MM))
+        g = module_fp(x=0, y=0)
+        g.antenna_side, g.edge_anchor_offset_nm = "-y", 5 * MM
+        g.edge_anchor_span_nm = (-2 * MM, 3 * MM)
+        g.flip_side()
+        self.assertEqual(g.edge_anchor_span_nm, (-2 * MM, 3 * MM))
+
+
 class TestGreedyKeepsPlainEdgeLockAngle(unittest.TestCase):
     """Greedy refine follows the 2026-11-04 rule for every edge lock, not only
     antenna_outward ones: J1's two nets pull it to 90/270 degrees. The

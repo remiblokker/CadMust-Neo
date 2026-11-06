@@ -104,6 +104,24 @@ def _flip_layer_name(name: str) -> str:
     return name
 
 
+def anchor_line_world(fp, side: str, end: int, span: Tuple[int, int]
+                      ) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """World end points of a module end line: the local line at outward
+    distance `end` along `side` ("+x", "-x", "+y", "-y"), running over
+    `span` (lo, hi) on the other local axis, rotated with fp's angle like
+    Pad.abs_position. Shared by the snap (Footprint.edge_anchor_span_world)
+    and the CadMust-Autopilot checker."""
+    sgn = 1 if side[0] == "+" else -1
+    rad = math.radians(-fp.angle_deg)
+    c, s = math.cos(rad), math.sin(rad)
+    out = []
+    for u in span:
+        lx, ly = (sgn * end, u) if side[1] == "x" else (u, sgn * end)
+        out.append((fp.x + int(round(lx * c - ly * s)),
+                    fp.y + int(round(lx * s + ly * c))))
+    return out[0], out[1]
+
+
 @dataclass
 class Footprint:
     """A component on the board."""
@@ -160,9 +178,15 @@ class Footprint:
     # outward distance (nm, local frame at 0 degrees) from the origin to the
     # module end along antenna_side; resnap_edges puts that line on the
     # locked edge instead of the bbox. 0 = no anchor (bbox snap).
+    # edge_anchor_span_nm: the module's own width across antenna_side, as
+    # (lo, hi) of the pad-centre extent along the other local axis (nm, 0
+    # degrees); the snap takes the outermost outline point over that width
+    # as the edge reference (cost_function.anchor_edge_reference). None =
+    # no width known (older pickles): the bbox-span innermost reference.
     overhang_ok: bool = False
     antenna_side: Optional[str] = None
     edge_anchor_offset_nm: int = 0
+    edge_anchor_span_nm: Optional[Tuple[int, int]] = None
     # Cached trig values for abs_position (updated via set_angle)
     _cos_a: float = field(init=False, repr=False, default=1.0)
     _sin_a: float = field(init=False, repr=False, default=0.0)
@@ -277,9 +301,23 @@ class Footprint:
         a_side = getattr(self, 'antenna_side', None)
         if a_side in ("+y", "-y"):
             self.antenna_side = "-y" if a_side == "+y" else "+y"
+        span = getattr(self, 'edge_anchor_span_nm', None)
+        if span is not None and a_side in ("+x", "-x"):
+            # a +/-x antenna side: the width runs along local y, mirrored
+            self.edge_anchor_span_nm = (-span[1], -span[0])
         self.set_angle((-self.angle_deg) % 360.0)
         self.is_front = not getattr(self, 'is_front', True)
         self.side_flipped = not getattr(self, 'side_flipped', False)
+
+    def edge_anchor_span_world(self) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+        """World end points of the module end line over the module's own
+        width (edge_anchor_span_nm), None without an anchor or a width."""
+        off = getattr(self, 'edge_anchor_offset_nm', 0)
+        side = getattr(self, 'antenna_side', None)
+        span = getattr(self, 'edge_anchor_span_nm', None)
+        if not off or side is None or span is None:
+            return None
+        return anchor_line_world(self, side, off, span)
 
     def edge_anchor_world(self) -> Optional[Tuple[int, int]]:
         """World position of the edge anchor point (the module end on the

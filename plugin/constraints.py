@@ -368,6 +368,18 @@ def pad_centre_extent(fp) -> Optional[Tuple[int, int, int, int]]:
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def module_width_span(fp, side: str) -> Optional[Tuple[int, int]]:
+    """The module's own width across antenna side `side`: (lo, hi) of the
+    pad-centre extent along the other local axis (nm, 0 degrees), the same
+    width as the antenna strip; None without pads. The edge reference of an
+    antenna_outward lock is taken over this width
+    (cost_function.anchor_edge_reference), not over the courtyard."""
+    ext = pad_centre_extent(fp)
+    if ext is None:
+        return None
+    return (ext[1], ext[3]) if side[1] == "x" else (ext[0], ext[2])
+
+
 def pad_sides(fp) -> Dict[str, int]:
     """Pad count per local side ("+x", "-x", "+y", "-y"), placement-blind.
 
@@ -1112,6 +1124,7 @@ def _apply_antenna_outward(model: BoardModel, idx: int, edge: str,
                          "faces the %s edge" % (ref, old, want, res.side, edge))
     f.antenna_side = res.side
     f.edge_anchor_offset_nm = int(res.antenna_end)
+    f.edge_anchor_span_nm = module_width_span(f, res.side)
     f.overhang_ok = True
     rep._applied("antenna_outward")
 
