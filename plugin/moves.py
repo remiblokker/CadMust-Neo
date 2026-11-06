@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple
 from .board_model import BoardModel
 from .cost_function import (point_in_polygon, polygon_edge_limit,
-                            _polygon_is_rectangular, dist_to_polygon)
+                            _polygon_is_rectangular, dist_to_polygon,
+                            locked_edge_clip)
 
 
 @dataclass
@@ -64,6 +65,18 @@ def _edge_snap_polygon(model: BoardModel):
     snap = None if _polygon_is_rectangular(poly, *bb) else poly
     _SNAP_POLY_CACHE[id(poly)] = (poly, bb, snap)
     return snap
+
+
+def _boundary_bbox(model: BoardModel, fp, bb=None):
+    """fp's bbox (or bb) as the off-board tests see it: clipped at the locked
+    edge for a part that may overhang it (cost_function.locked_edge_clip),
+    else unchanged. None when nothing is left on the board side."""
+    if bb is None:
+        bb = fp.bbox
+    if not getattr(fp, "overhang_ok", False) or fp.edge_lock is None:
+        return bb
+    return locked_edge_clip(fp, bb, _edge_snap_polygon(model), model.outline_xmin,
+                            model.outline_ymin, model.outline_xmax, model.outline_ymax)
 
 
 def resnap_edges(model: BoardModel, members: List[int]) -> None:
@@ -180,13 +193,18 @@ def _clamp_group_to_board(model: BoardModel, members: List[int]) -> None:
 
     Computes the aggregate bbox of all members and determines the minimum
     (dx, dy) correction needed, then applies it uniformly to all members.
+    A part that may overhang its locked edge counts with its bbox clipped
+    there (_boundary_bbox).
     """
     # Compute aggregate bbox using fp.bbox (correctly handles asymmetric footprints)
     agg_xmin = agg_ymin = float('inf')
     agg_xmax = agg_ymax = float('-inf')
     for idx in members:
         fp = model.footprints[idx]
-        x1, y1, x2, y2 = fp.bbox
+        bb = _boundary_bbox(model, fp)
+        if bb is None:
+            continue
+        x1, y1, x2, y2 = bb
         agg_xmin = min(agg_xmin, x1)
         agg_ymin = min(agg_ymin, y1)
         agg_xmax = max(agg_xmax, x2)
@@ -204,6 +222,8 @@ def _clamp_group_to_board(model: BoardModel, members: List[int]) -> None:
     elif agg_ymax > model.outline_ymax:
         cy = model.outline_ymax - agg_ymax
 
+    if agg_xmin == float('inf'):
+        return
     if cx != 0 or cy != 0:
         for idx in members:
             model.footprints[idx].x += cx
@@ -214,13 +234,18 @@ OFFBOARD_MODES = ("clamp", "reject")
 
 
 def _group_bbox_excess(model: BoardModel, members: List[int]) -> int:
-    """Sum over members of how far (nm) each bbox leaves the outline bbox."""
+    """Sum over members of how far (nm) each bbox leaves the outline bbox.
+    A part that may overhang its locked edge counts with its bbox clipped
+    there (_boundary_bbox), so only its other three sides can be off."""
     fps = model.footprints
     xmin, ymin = model.outline_xmin, model.outline_ymin
     xmax, ymax = model.outline_xmax, model.outline_ymax
     total = 0
     for idx in members:
-        x1, y1, x2, y2 = fps[idx].bbox
+        bb = _boundary_bbox(model, fps[idx])
+        if bb is None:
+            continue
+        x1, y1, x2, y2 = bb
         total += (max(0, xmin - x1) + max(0, x2 - xmax)
                   + max(0, ymin - y1) + max(0, y2 - ymax))
     return total
@@ -340,7 +365,10 @@ def _hits_polygon_cutout(model: BoardModel, members: List[int],
 
     for idx in members:
         fp = model.footprints[idx]
-        x1, y1, x2, y2 = fp.bbox
+        nb = _boundary_bbox(model, fp)
+        if nb is None:
+            continue
+        x1, y1, x2, y2 = nb
         new_corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
 
         new_outside = [not _on_board(nx, ny, poly) for nx, ny in new_corners]
@@ -357,12 +385,11 @@ def _hits_polygon_cutout(model: BoardModel, members: List[int],
             ohw, ohh = fp.height // 2, fp.width // 2
         else:
             ohw, ohh = fp.width // 2, fp.height // 2
-        old_corners = [
-            (old_bcx - ohw, old_bcy - ohh),
-            (old_bcx + ohw, old_bcy - ohh),
-            (old_bcx + ohw, old_bcy + ohh),
-            (old_bcx - ohw, old_bcy + ohh),
-        ]
+        ob = _boundary_bbox(model, fp, (old_bcx - ohw, old_bcy - ohh,
+                                         old_bcx + ohw, old_bcy + ohh))
+        if ob is None:
+            continue
+        old_corners = [(ob[0], ob[1]), (ob[2], ob[1]), (ob[2], ob[3]), (ob[0], ob[3])]
 
         for ci, is_new_outside in enumerate(new_outside):
             if is_new_outside and _on_board(old_corners[ci][0], old_corners[ci][1], poly):
@@ -408,7 +435,10 @@ def _kickout_polygon_violations(
         # Collect all bbox corners for the whole group
         all_corners = []
         for idx in members:
-            x1, y1, x2, y2 = model.footprints[idx].bbox
+            bb = _boundary_bbox(model, model.footprints[idx])
+            if bb is None:
+                continue
+            x1, y1, x2, y2 = bb
             all_corners.extend([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
 
         if all(_on_board(cx, cy, poly) for cx, cy in all_corners):

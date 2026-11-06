@@ -334,6 +334,50 @@ def polygon_edge_limit(poly: List[Tuple[int, int]], edge: str,
     return best
 
 
+def locked_edge_clip(fp, bb: Tuple[int, int, int, int],
+                     poly: Optional[List[Tuple[int, int]]],
+                     oxmin: int, oymin: int, oxmax: int, oymax: int
+                     ) -> Optional[Tuple[int, int, int, int]]:
+    """The bbox the boundary tests use for footprint fp.
+
+    For an edge-locked part that may overhang its locked edge
+    (Footprint.overhang_ok, set from the file's overhang_ok and for every
+    antenna_outward lock) the bbox side on that edge is pulled back to the
+    edge reference: the outline bbox edge, on a polygonal outline (poly not
+    None) the innermost polygon boundary point over the bbox span
+    (polygon_edge_limit, the snap target). The other three sides are
+    unchanged. The CadMust-Autopilot checker clips the same way. Every
+    other part: bb as given. None when nothing is left on the board side."""
+    edge = fp.edge_lock if getattr(fp, "overhang_ok", False) else None
+    if edge is None:
+        return bb
+    x1, y1, x2, y2 = bb
+    if edge == "top":
+        ref = oymin
+    elif edge == "bottom":
+        ref = oymax
+    elif edge == "left":
+        ref = oxmin
+    else:
+        ref = oxmax
+    if poly is not None:
+        lo, hi = (x1, x2) if edge in ("top", "bottom") else (y1, y2)
+        lim = polygon_edge_limit(poly, edge, lo, hi)
+        if lim is not None:
+            ref = lim
+    if edge == "top":
+        y1 = max(y1, ref)
+    elif edge == "bottom":
+        y2 = min(y2, ref)
+    elif edge == "left":
+        x1 = max(x1, ref)
+    else:
+        x2 = min(x2, ref)
+    if x1 >= x2 or y1 >= y2:
+        return None
+    return (x1, y1, x2, y2)
+
+
 def outline_is_polygonal(model) -> bool:
     """True when the model's outline polygon differs from its bounding box
     (an L-shape, notch or bevel). False for no polygon or a rectangle."""
@@ -528,6 +572,11 @@ class CostState:
                 model.outline_xmax, model.outline_ymax):
             poly = None  # treat as rectangular: bbox check is sufficient
         self._outline_polygon = poly
+        # Edge-locked parts that may overhang their locked edge
+        # (Footprint.overhang_ok): the boundary penalty clips their bbox there.
+        self._overhang_fps: Set[int] = {
+            i for i, f in enumerate(model.footprints)
+            if getattr(f, "edge_lock", None) and getattr(f, "overhang_ok", False)}
 
         # Congestion grid — None when disabled (zero overhead)
         self._cong_grid: Optional[_CongestionGrid] = None
@@ -898,13 +947,21 @@ class CostState:
         Uses cached bbox arrays (_bx1/_by1/_bx2/_by2), precomputed net scale,
         and cached board extents to avoid redundant attribute lookups.
         """
-        if self.model.footprints[fp_idx].locked:
+        fp = self.model.footprints[fp_idx]
+        if fp.locked:
             return 0.0
         net_scale = self._fp_net_scale[fp_idx]
         xmin = self._bx1[fp_idx]
         ymin = self._by1[fp_idx]
         xmax = self._bx2[fp_idx]
         ymax = self._by2[fp_idx]
+        if fp_idx in self._overhang_fps:
+            # the part may reach past its locked edge: clip the bbox there
+            cb = locked_edge_clip(fp, (xmin, ymin, xmax, ymax), self._outline_polygon,
+                                  self._oxmin, self._oymin, self._oxmax, self._oymax)
+            if cb is None:
+                return 0.0
+            xmin, ymin, xmax, ymax = cb
         dx = max(0, self._oxmin - xmin) + max(0, xmax - self._oxmax)
         dy = max(0, self._oymin - ymin) + max(0, ymax - self._oymax)
         total = (dx + dy) * BOUNDARY_WEIGHT * net_scale
