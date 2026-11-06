@@ -217,5 +217,45 @@ class TestGreedyKeepsAngle(unittest.TestCase):
         self.assertEqual(m.footprints[0].edge_anchor_world()[1], 0)
 
 
+class TestGreedyKeepsPlainEdgeLockAngle(unittest.TestCase):
+    """Greedy refine follows the 2026-11-04 rule for every edge lock, not only
+    antenna_outward ones: J1's two nets pull it to 90/270 degrees. The
+    unlocked control proves greedy would rotate it (the broken case: before
+    the guard the left-locked J1 also ended at 270)."""
+
+    def _model(self, lock):
+        j1 = Footprint(reference="J1", index=0, x=5 * MM, y=37 * MM, angle_deg=0.0,
+                       width=10 * MM, height=2 * MM, locked=False,
+                       pads=[Pad(1, "A", -4 * MM, 0), Pad(2, "B", 4 * MM, 0)],
+                       net_codes={1, 2})
+        fps = [j1]
+        for k, (y, n) in enumerate(((10, 1), (65, 2))):
+            fps.append(Footprint(reference="R%d" % (k + 1), index=k + 1, x=5 * MM,
+                                 y=y * MM, angle_deg=0.0, width=2 * MM, height=MM,
+                                 locked=True, pads=[Pad(n, "AB"[n - 1], 0, 0)],
+                                 net_codes={n}))
+        nets = {1: Net(1, "A", pad_refs=[(0, 0), (1, 0)]),
+                2: Net(2, "B", pad_refs=[(0, 1), (2, 0)])}
+        m = BoardModel(footprints=fps, nets=nets, outline_xmin=0, outline_ymin=0,
+                       outline_xmax=BW, outline_ymax=BH, moveable_indices=[0])
+        if lock:
+            apply_constraints(m, parse_constraints(doc(
+                {"edge_locked": [{"ref": "J1", "edge": "left"}]})), log=None)
+        return m
+
+    def _refined_angle(self, lock):
+        from plugin.annealer import _greedy_refine
+        from plugin.cost_function import CostState
+        m = self._model(lock)
+        _greedy_refine(m, CostState(m, quiet=True), [0])
+        return m.footprints[0].angle_deg
+
+    def test_unlocked_control_rotates(self):
+        self.assertIn(self._refined_angle(False), (90.0, 270.0))
+
+    def test_plain_edge_lock_keeps_angle(self):
+        self.assertEqual(self._refined_angle(True), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

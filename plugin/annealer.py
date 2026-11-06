@@ -14,7 +14,7 @@ from .cost_function import CostState, COHESION_WEIGHT, ZONE_WEIGHT
 from .moves import (
     select_move_type, do_translate, do_median, do_swap, do_rotate,
     revert_move, affected_indices, MoveUndo, _get_group_members,
-    _compute_t_ratio, resnap_edges,
+    _compute_t_ratio, resnap_edges, _members_edge_locked,
 )
 
 
@@ -438,10 +438,11 @@ def _greedy_refine(
                         model.footprints[idx].set_angle(oa)
                     cost_state.restore(snap)
 
-            # Try rotations (single fp only, skip for groups — too disruptive)
-            # (never for a part whose antenna must face its locked edge)
-            if len(members) == 1 and not getattr(
-                    model.footprints[members[0]], "antenna_side", None):
+            # Try rotations (single fp only, skip for groups — too disruptive).
+            # Never for an edge-locked part: it keeps its orientation (decision
+            # 2026-11-04, the same rule as do_rotate; an antenna_outward part
+            # is edge-locked too, so its antenna keeps facing the edge).
+            if len(members) == 1 and not _members_edge_locked(model, members):
                 fp = model.footprints[members[0]]
                 for rot in rotations:
                     fp.set_angle((old_states[0][3] + rot) % 360.0)
