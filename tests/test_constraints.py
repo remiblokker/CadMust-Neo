@@ -777,6 +777,26 @@ def _locked_model():
     return m
 
 
+class TestEdgeLockFlags(unittest.TestCase):
+    """overhang_ok and antenna_outward on an edge_locked item are booleans."""
+
+    def _doc(self, lock):
+        return {"meta": {}, "component_groups": [], "net_priorities": {},
+                "placement_constraints": {"edge_locked": [lock]}}
+
+    def test_flags_accepted(self):
+        parse_constraints(self._doc({"ref": "U3", "edge": "top", "antenna_outward": True,
+                                     "overhang_ok": True}))
+
+    def test_non_boolean_rejected(self):
+        # broken cases: a string and a number where a boolean belongs
+        with self.assertRaises(ConstraintError):
+            parse_constraints(self._doc({"ref": "U3", "edge": "top",
+                                         "antenna_outward": "yes"}))
+        with self.assertRaises(ConstraintError):
+            parse_constraints(self._doc({"ref": "U3", "edge": "top", "overhang_ok": 1}))
+
+
 class TestConstrainedRefs(unittest.TestCase):
     def test_every_per_ref_key_and_group_member(self):
         refs = constrained_refs(cset_of(_full_constraints()))

@@ -262,6 +262,10 @@ def _validate(data) -> Tuple[List[str], List[str]]:
                     if key == "edge_locked" and isinstance(it.get("edge"), str) \
                             and it["edge"] not in EDGES:
                         errors.append("%s.edge must be one of %s" % (where, list(EDGES)))
+                    if key == "edge_locked":
+                        for flag in ("overhang_ok", "antenna_outward"):
+                            if flag in it and not isinstance(it[flag], bool):
+                                errors.append("%s.%s must be true or false" % (where, flag))
                     if key == "zone_preferences" and isinstance(it.get("zone"), str) \
                             and it["zone"] not in ZONES:
                         errors.append("%s.zone must be one of %s" % (where, ZONES))
